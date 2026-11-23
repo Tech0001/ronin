@@ -86,6 +86,8 @@ export function App() {
   const [reconnectCounter, setReconnectCounter] = useState(0);
   const [maximizedId, setMaximizedId] = useState<number | null>(null);
   const [displayVersions, setDisplayVersions] = useState<Record<number, number>>({});
+  const [searchTriggers, setSearchTriggers] = useState<Record<number, number>>({});
+  const [attentionIds, setAttentionIds] = useState<Set<number>>(() => new Set());
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const [toast, setToast] = useState<string | null>(null);
 
@@ -451,6 +453,68 @@ export function App() {
     }
   };
 
+  const handleStartAll = async (runCommands = false) => {
+    const stopped = workspaceRef.current.lanes.filter((l) => !remotes.get(l.processId)?.running);
+    if (!stopped.length) return;
+    try {
+      await Promise.all(
+        stopped.map((lane) => api.terminalStart(lane.processId, lane.cwd).catch(() => {})),
+      );
+      const list = await api.daemonList();
+      const next = new Map<number, RemoteTerminal>();
+      for (const t of list) next.set(t.id, t);
+      setRemotes(next);
+      if (runCommands) {
+        await new Promise((r) => setTimeout(r, 180));
+        await Promise.all(
+          stopped
+            .filter((l) => l.command.trim())
+            .map((l) => api.terminalWrite(l.processId, l.command + '\r').catch(() => {})),
+        );
+      }
+      showToast(
+        runCommands
+          ? `Started ${stopped.length} lane${stopped.length === 1 ? '' : 's'} and launched saved commands.`
+          : `Started ${stopped.length} shell${stopped.length === 1 ? '' : 's'}.`,
+      );
+    } catch (err) {
+      showToast(String(err));
+    }
+  };
+
+  const handleLaneFontSize = useCallback(
+    (id: number, fontSize: number | undefined) => {
+      updateWorkspace(
+        (prev) => ({
+          ...prev,
+          lanes: prev.lanes.map((l) =>
+            l.processId === id ? { ...l, fontSize } : l,
+          ),
+        }),
+        true,
+      );
+    },
+    [updateWorkspace],
+  );
+
+  const markAttention = useCallback((id: number) => {
+    setAttentionIds((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  }, []);
+
+  const clearAttention = useCallback((id: number) => {
+    setAttentionIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
   const handleRefreshDisplay = useCallback(
     async (id: number) => {
       try {
@@ -702,6 +766,14 @@ export function App() {
       workspace.lanes.filter((l) => remotes.get(l.processId)?.running).length,
     [workspace.lanes, remotes],
   );
+  const stoppedCount = workspace.lanes.length - runningCount;
+  const stoppedWithCommandsCount = useMemo(
+    () =>
+      workspace.lanes.filter(
+        (l) => !remotes.get(l.processId)?.running && l.command.trim().length > 0,
+      ).length,
+    [workspace.lanes, remotes],
+  );
 
   const canvasDimensions = useMemo(() => {
     if (maximizedId !== null) return { width: '100%', height: '100%' };
@@ -788,6 +860,7 @@ export function App() {
           folders={workspace.folders}
           lanes={workspace.lanes}
           remotes={remotes}
+          attentionIds={attentionIds}
           notes={workspace.notes}
           tasks={workspace.tasks}
           homeDir={homeDir}
@@ -812,6 +885,7 @@ export function App() {
           }
           onNewTerminalInDir={(dir) => setLaneModal({ mode: 'create', kind: 'terminal', cwd: dir })}
           onSelectLane={(id) => {
+            clearAttention(id);
             setMaximizedId(null);
             requestAnimationFrame(() => {
               document
@@ -823,6 +897,7 @@ export function App() {
           onAddLane={(kind) => setLaneModal({ mode: 'create', kind })}
           onEditLane={(lane) => setLaneModal({ mode: 'edit', lane })}
           onStartLane={(id) => void handleStartLane(id)}
+          onStartAll={() => void handleStartAll(false)}
           onRunCommand={(id) => void handleRunCommand(id)}
           onChangeNotes={(notes) => updateWorkspace((prev) => ({ ...prev, notes }))}
           onChangeTasks={(tasks) => updateWorkspace((prev) => ({ ...prev, tasks }))}
@@ -863,6 +938,28 @@ export function App() {
               <Icon name="agent" size={14} />
               <span>Agent</span>
             </button>
+
+            {stoppedCount > 0 && (
+              <button
+                className="topbar-btn accent-outline"
+                title={`Start all ${stoppedCount} stopped shell${stoppedCount === 1 ? '' : 's'}`}
+                onClick={() => void handleStartAll(false)}
+              >
+                <Icon name="play" size={13} />
+                <span>Start all ({stoppedCount})</span>
+              </button>
+            )}
+
+            {stoppedWithCommandsCount > 0 && (
+              <button
+                className="topbar-btn"
+                title="Start stopped lanes and run their saved launch commands"
+                onClick={() => void handleStartAll(true)}
+              >
+                <Icon name="terminal" size={13} />
+                <span>Run all</span>
+              </button>
+            )}
 
             <button
               className="quick-open-pill"
@@ -1002,11 +1099,18 @@ export function App() {
               const remote = remotes.get(lane.processId);
               const isRunning = Boolean(remote?.running);
               const isMax = maximizedId === lane.processId;
+              const needsAttention = attentionIds.has(lane.processId);
+              const effectiveFontSize = lane.fontSize ?? workspace.settings.fontSize;
               return (
                 <article
                   key={lane.processId}
                   data-lane-id={lane.processId}
-                  className={`lane-card${isMax ? ' maximized' : ''}`}
+                  className={`lane-card${isMax ? ' maximized' : ''}${
+                    needsAttention ? ' attention' : ''
+                  }`}
+                  onMouseDownCapture={() => {
+                    if (needsAttention) clearAttention(lane.processId);
+                  }}
                   style={
                     isMax
                       ? { inset: 8 }
@@ -1027,7 +1131,11 @@ export function App() {
                       setMaximizedId((m) => (m === lane.processId ? null : lane.processId));
                     }}
                   >
-                    <span className={`dot${isRunning ? ' running' : ''}`} />
+                    <span
+                      className={`dot${isRunning ? ' running' : ''}${
+                        needsAttention ? ' attention' : ''
+                      }`}
+                    />
                     <strong
                       className="lane-title"
                       title={`${lane.cwd}${lane.command ? '\n' + lane.command : ''}`}
@@ -1037,7 +1145,34 @@ export function App() {
                     <span className={`lane-kind${remote?.agent ? ' agent-live' : ''}`}>
                       {remote?.agent ? remote.agent : lane.kind}
                     </span>
+                    {needsAttention && (
+                      <span className="lane-ready-pill" title="New output settled while unfocused">
+                        Ready
+                      </span>
+                    )}
+                    {lane.fontSize !== undefined && (
+                      <button
+                        className="lane-font-pill"
+                        title={`Custom pane font size (${lane.fontSize}px) — click to reset to ${workspace.settings.fontSize}px`}
+                        onClick={() => handleLaneFontSize(lane.processId, undefined)}
+                      >
+                        {lane.fontSize}px
+                      </button>
+                    )}
                     <span className="spacer" />
+                    <button
+                      className="icon-btn xs"
+                      title="Find in scrollback (Ctrl+Alt+F)"
+                      aria-label={`Search ${lane.name} scrollback`}
+                      onClick={() =>
+                        setSearchTriggers((curr) => ({
+                          ...curr,
+                          [lane.processId]: (curr[lane.processId] ?? 0) + 1,
+                        }))
+                      }
+                    >
+                      <Icon name="search" size={13} />
+                    </button>
                     <button
                       className="icon-btn xs"
                       title="Refresh display without restarting terminal"
@@ -1079,18 +1214,25 @@ export function App() {
                     lane={lane}
                     remote={remote}
                     connected={daemon.connected}
-                    fontSize={workspace.settings.fontSize}
+                    fontSize={effectiveFontSize}
+                    defaultFontSize={workspace.settings.fontSize}
                     fontFamily={workspace.settings.fontFamily}
                     theme={theme}
                     selectionStyle={workspace.settings.selectionStyle}
                     reconnectCounter={reconnectCounter}
+                    searchTrigger={searchTriggers[lane.processId] ?? 0}
                     registerOutput={registerOutput}
                     onOpenLink={handleOpenLink}
                     onRefreshDisplay={(id) => void handleRefreshDisplay(id)}
                     onFocusChange={(id, focused) => {
                       terminalFocusedRef.current = focused;
-                      if (focused) activeLaneRef.current = id;
+                      if (focused) {
+                        activeLaneRef.current = id;
+                        clearAttention(id);
+                      }
                     }}
+                    onAttention={markAttention}
+                    onChangeFontSize={handleLaneFontSize}
                   />
 
                   <footer className="lane-footer">

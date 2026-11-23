@@ -9,7 +9,7 @@ use crate::files::{
     read_file_preview, search_workspace, DirEntryItem, FilePreviewResult, QuickFileItem,
     SearchResponse,
 };
-use crate::state::{load_state, save_state, WorkspaceState};
+use crate::state::{load_state, save_state, WindowGeometry, WorkspaceState};
 use crate::theme::{load_theme, watch_omarchy_theme, ThemePalette};
 use notify::RecommendedWatcher;
 use ronin_daemon::agent::{foreground_agent, pi_copies_selection_on_select};
@@ -75,9 +75,13 @@ async fn app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, S
 }
 
 #[tauri::command]
-fn workspace_save(workspace: WorkspaceState, state: State<'_, AppState>) -> Result<(), String> {
+fn workspace_save(mut workspace: WorkspaceState, state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.workspace.lock().unwrap();
+    if workspace.window.is_none() {
+        workspace.window = guard.window.clone();
+    }
     save_state(&workspace)?;
-    *state.workspace.lock().unwrap() = workspace;
+    *guard = workspace;
     Ok(())
 }
 
@@ -294,11 +298,68 @@ pub fn run() {
             let daemon = DaemonClient::new(handle.clone());
             let watcher = watch_omarchy_theme(handle.clone());
             let workspace = load_state();
+            let saved_window = workspace.window.clone();
             app.manage(AppState {
                 daemon,
                 workspace: Mutex::new(workspace),
                 _theme_watcher: Mutex::new(watcher),
             });
+
+            if let Some(main_win) = app.get_webview_window("main") {
+                if let Some(geom) = saved_window {
+                    if geom.maximized {
+                        let _ = main_win.maximize();
+                    } else if geom.width >= 760 && geom.height >= 500 {
+                        let _ = main_win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+                            f64::from(geom.width),
+                            f64::from(geom.height),
+                        )));
+                    }
+                }
+                let win_handle = main_win.clone();
+                let app_handle = handle.clone();
+                main_win.on_window_event(move |event| {
+                    if matches!(
+                        event,
+                        tauri::WindowEvent::Resized(_) | tauri::WindowEvent::CloseRequested { .. }
+                    ) {
+                        let maximized = win_handle.is_maximized().unwrap_or(false);
+                        let state = app_handle.state::<AppState>();
+                        let mut guard = state.workspace.lock().unwrap();
+                        let next_geom = if maximized {
+                            let prev = guard.window.clone().unwrap_or(WindowGeometry {
+                                width: 1360,
+                                height: 860,
+                                maximized: true,
+                            });
+                            WindowGeometry {
+                                width: prev.width,
+                                height: prev.height,
+                                maximized: true,
+                            }
+                        } else if let (Ok(phys), Ok(scale)) =
+                            (win_handle.inner_size(), win_handle.scale_factor())
+                        {
+                            let log = phys.to_logical::<u32>(scale);
+                            if log.width >= 760 && log.height >= 500 {
+                                WindowGeometry {
+                                    width: log.width,
+                                    height: log.height,
+                                    maximized: false,
+                                }
+                            } else {
+                                return;
+                            }
+                        } else {
+                            return;
+                        };
+                        guard.window = Some(next_geom);
+                        if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                            let _ = save_state(&guard);
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

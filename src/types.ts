@@ -8,6 +8,7 @@ export interface Lane {
   y: number;
   width: number;
   height: number;
+  fontSize?: number;
 }
 
 export interface RemoteTerminal {

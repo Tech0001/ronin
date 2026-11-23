@@ -14,6 +14,17 @@ pub struct Lane {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowGeometry {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +112,8 @@ pub struct WorkspaceState {
     pub tasks: Vec<TaskItem>,
     #[serde(default)]
     pub settings: AppSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowGeometry>,
 }
 
 impl Default for WorkspaceState {
@@ -116,6 +129,7 @@ impl Default for WorkspaceState {
             notes: String::new(),
             tasks: Vec::new(),
             settings: AppSettings::default(),
+            window: None,
         }
     }
 }

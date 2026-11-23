@@ -10,6 +10,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "build:release": "npm run build && cargo build --release --manifest-path src-tauri/Cargo.toml -p ronin-daemon && cargo build --release --manifest-path src-tauri/Cargo.toml -p ronin --features custom-protocol",
+    "package:linux": "bash scripts/package-linux.sh",
     "install:linux": "npm run build:release && bash scripts/install-desktop.sh",
     "test": "vitest run",
     "tauri": "tauri"
@@ -18,6 +19,7 @@
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
     "@xterm/xterm": "^6.0.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"

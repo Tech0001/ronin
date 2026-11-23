@@ -270,6 +270,7 @@ export function Sidebar({
   folders,
   lanes,
   remotes,
+  attentionIds,
   notes,
   tasks,
   homeDir,
@@ -284,6 +285,7 @@ export function Sidebar({
   onAddLane,
   onEditLane,
   onStartLane,
+  onStartAll,
   onRunCommand,
   onChangeNotes,
   onChangeTasks,
@@ -295,6 +297,7 @@ export function Sidebar({
   folders: string[];
   lanes: Lane[];
   remotes: Map<number, RemoteTerminal>;
+  attentionIds: Set<number>;
   notes: string;
   tasks: TaskItem[];
   homeDir: string;
@@ -309,6 +312,7 @@ export function Sidebar({
   onAddLane: (kind: 'terminal' | 'agent') => void;
   onEditLane: (lane: Lane) => void;
   onStartLane: (id: number) => void;
+  onStartAll: () => void;
   onRunCommand: (id: number) => void;
   onChangeNotes: (notes: string) => void;
   onChangeTasks: (tasks: TaskItem[]) => void;
@@ -536,6 +540,13 @@ export function Sidebar({
             <div className="sidebar-head-actions">
               <button
                 className="icon-btn sm"
+                title="Start all stopped shells"
+                onClick={onStartAll}
+              >
+                <Icon name="play" size={13} />
+              </button>
+              <button
+                className="icon-btn sm"
                 title="New terminal lane"
                 onClick={() => onAddLane('terminal')}
               >
@@ -574,6 +585,7 @@ export function Sidebar({
                   .map((lane) => {
                     const remote = remotes.get(lane.processId);
                     const isRunning = Boolean(remote?.running);
+                    const needsAttention = attentionIds.has(lane.processId);
                     return (
                       <div key={lane.processId} className="lane-list-row">
                         <button
@@ -581,9 +593,16 @@ export function Sidebar({
                           onClick={() => onSelectLane(lane.processId)}
                           title={lane.cwd}
                         >
-                          <span className={`dot${isRunning ? ' running' : ''}`} />
+                          <span
+                            className={`dot${isRunning ? ' running' : ''}${
+                              needsAttention ? ' attention' : ''
+                            }`}
+                          />
                           <span className="lane-list-name">{lane.name}</span>
-                          {remote?.agent && <span className="pill subtle">{remote.agent}</span>}
+                          {needsAttention && <span className="pill accent-soft">Ready</span>}
+                          {!needsAttention && remote?.agent && (
+                            <span className="pill subtle">{remote.agent}</span>
+                          )}
                         </button>
                         <span className="row-actions">
                           <button

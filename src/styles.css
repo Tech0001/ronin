@@ -179,6 +179,23 @@ textarea:focus-visible {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--ansi-green) 24%, transparent);
 }
 
+.dot.attention {
+  background: var(--accent);
+  opacity: 1;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 36%, transparent);
+  animation: ronin-pulse 1.9s ease-in-out infinite;
+}
+
+@keyframes ronin-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 26%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 44%, transparent);
+  }
+}
+
 kbd {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -806,6 +823,16 @@ kbd {
   background: var(--hover-bg);
 }
 
+.topbar-btn.accent-outline {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--fg-bright);
+}
+
+.topbar-btn.accent-outline:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 .quick-open-pill {
   margin-left: 4px;
   height: 27px;
@@ -1027,6 +1054,40 @@ kbd {
     0 6px 20px rgba(0, 0, 0, 0.36);
 }
 
+.lane-card.attention {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--bg));
+}
+
+.lane-ready-pill {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  color: var(--fg-bright);
+  flex-shrink: 0;
+}
+
+.lane-font-pill {
+  min-height: 19px;
+  height: 19px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  border-color: var(--line);
+  color: var(--fg-soft);
+  background: color-mix(in srgb, var(--bg) 75%, transparent);
+  flex-shrink: 0;
+}
+
+.lane-font-pill:hover {
+  border-color: var(--accent);
+  color: var(--fg-bright);
+}
+
 .lane-header {
   height: 32px;
   flex-shrink: 0;
@@ -1071,12 +1132,47 @@ kbd {
 }
 
 .terminal-wrap {
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow: hidden;
   padding: 6px 5px 6px 8px;
   background: var(--bg);
   overscroll-behavior: contain;
+}
+
+.term-search-bar {
+  position: absolute;
+  top: 6px;
+  right: 12px;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 5px 3px 8px;
+  background: var(--elevated);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  color: var(--fg-muted);
+}
+
+.term-search-bar input {
+  width: 155px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  font-size: 12px;
+  color: var(--fg-bright);
+}
+
+.term-search-count {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  min-width: 3.5ch;
+  text-align: right;
+  color: var(--fg-muted);
+  padding-right: 2px;
 }
 
 .terminal-wrap.drag-over {

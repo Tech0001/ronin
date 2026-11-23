@@ -128,6 +128,30 @@ describe('terminalFiles & shortcuts', () => {
         false,
       ),
     ).toBe('escape');
+    expect(
+      terminalShortcut(
+        { key: '=', shiftKey: false, ctrlKey: true, metaKey: false, altKey: false },
+        false,
+      ),
+    ).toBe('zoomIn');
+    expect(
+      terminalShortcut(
+        { key: '-', shiftKey: false, ctrlKey: true, metaKey: false, altKey: false },
+        false,
+      ),
+    ).toBe('zoomOut');
+    expect(
+      terminalShortcut(
+        { key: '0', shiftKey: false, ctrlKey: true, metaKey: false, altKey: false },
+        false,
+      ),
+    ).toBe('zoomReset');
+    expect(
+      terminalShortcut(
+        { key: 'f', shiftKey: false, ctrlKey: true, metaKey: false, altKey: true },
+        false,
+      ),
+    ).toBe('find');
   });
 
   it('tokenizes rust keywords and comments', () => {
