@@ -43,6 +43,10 @@
       "deb": {
         "depends": []
       }
+    },
+    "macOS": {
+      "signingIdentity": "-",
+      "minimumSystemVersion": "11.0"
     }
   }
 }

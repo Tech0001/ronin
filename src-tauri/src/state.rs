@@ -184,7 +184,10 @@ pub fn save_state(state: &WorkspaceState) -> Result<(), String> {
     }
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let json = serde_json::to_vec_pretty(state).map_err(|e| format!("Failed to serialize state: {e}"))?;
-    fs::write(&tmp, json).map_err(|e| format!("Failed to write temp state: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("Failed to save state: {e}"))?;
+    fs::write(&tmp, &json).map_err(|e| format!("Failed to write temp state: {e}"))?;
+    if fs::rename(&tmp, &path).is_err() {
+        fs::write(&path, &json).map_err(|e| format!("Failed to save state: {e}"))?;
+        let _ = fs::remove_file(&tmp);
+    }
     Ok(())
 }

@@ -138,11 +138,11 @@ pub fn read_git_branch(path: &str) -> Option<(String, String)> {
 }
 
 /// Read the live working directory of a shell (or its foreground process group) from `/proc`.
+#[cfg(target_os = "linux")]
 pub fn live_process_cwd(shell_pid: u32) -> Option<String> {
     if shell_pid == 0 {
         return None;
     }
-    // Check foreground process group first in case a foreground tool changed directory.
     if let Ok(stat_text) = fs::read_to_string(format!("/proc/{shell_pid}/stat")) {
         if let Some(rparen) = stat_text.rfind(')') {
             if let Some(after) = stat_text.get(rparen + 2..) {
@@ -160,6 +160,11 @@ pub fn live_process_cwd(shell_pid: u32) -> Option<String> {
     fs::read_link(format!("/proc/{shell_pid}/cwd"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn live_process_cwd(_shell_pid: u32) -> Option<String> {
+    None
 }
 
 /// Atomically save edited text content to an existing text file.
@@ -185,9 +190,11 @@ pub fn write_text_file(path: &str, content: &str) -> Result<(), String> {
     if let Some(perms) = existing_perms {
         let _ = fs::set_permissions(&tmp, perms);
     }
-    if let Err(err) = fs::rename(&tmp, target) {
+    if fs::rename(&tmp, target).is_err() {
+        let res = fs::write(target, content.as_bytes())
+            .map_err(|e| format!("Failed saving file: {e}"));
         let _ = fs::remove_file(&tmp);
-        return Err(format!("Failed saving file: {err}"));
+        return res;
     }
     Ok(())
 }
@@ -870,63 +877,144 @@ pub fn open_external(target: &str, cwd: Option<&str>) -> Result<(), String> {
         resolved.to_string_lossy().into_owned()
     };
 
-    Command::new("xdg-open")
-        .arg(&arg)
-        .stdin(Stdio::null())
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(&arg);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", &arg]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(&arg);
+        c
+    };
+
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to open externally with xdg-open: {e}"))?;
+        .map_err(|e| format!("Failed to open externally: {e}"))?;
     Ok(())
 }
 
 pub fn clipboard_read() -> Result<String, String> {
-    if let Ok(output) = Command::new("wl-paste")
-        .args(["--no-newline"])
-        .output()
+    #[cfg(target_os = "macos")]
     {
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        if let Ok(output) = Command::new("pbpaste").output() {
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
         }
+        return Ok(String::new());
     }
-    if let Ok(output) = Command::new("xclip")
-        .args(["-selection", "clipboard", "-o"])
-        .output()
+    #[cfg(windows)]
     {
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        if let Ok(output) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+            .output()
+        {
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
         }
+        return Ok(String::new());
     }
-    Ok(String::new())
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        if let Ok(output) = Command::new("wl-paste")
+            .args(["--no-newline"])
+            .output()
+        {
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+        }
+        if let Ok(output) = Command::new("xclip")
+            .args(["-selection", "clipboard", "-o"])
+            .output()
+        {
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+        }
+        Ok(String::new())
+    }
 }
 
 pub fn clipboard_write(text: &str) -> Result<(), String> {
-    if let Ok(mut child) = Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    #[cfg(target_os = "macos")]
     {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+        if let Ok(mut child) = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return Ok(());
         }
-        let _ = child.wait();
-        return Ok(());
+        return Err("Failed running pbcopy.".into());
     }
-    if let Ok(mut child) = Command::new("xclip")
-        .args(["-selection", "clipboard"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    #[cfg(windows)]
     {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+        if let Ok(mut child) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::In.ReadToEnd() | Set-Clipboard",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return Ok(());
         }
-        let _ = child.wait();
-        return Ok(());
+        return Err("Failed writing to Windows clipboard.".into());
     }
-    Err("No clipboard utility found (wl-copy or xclip).".into())
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        if let Ok(mut child) = Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return Ok(());
+        }
+        if let Ok(mut child) = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return Ok(());
+        }
+        Err("No clipboard utility found (wl-copy or xclip).".into())
+    }
 }
 
 #[cfg(test)]

@@ -40,13 +40,13 @@ pub fn agent_from_argv(argv: &[String]) -> Option<String> {
         .find(|arg| !arg.starts_with('-'))
         .map(|s| s.as_str())
         .unwrap_or("");
-    if script.contains("/@anthropic-ai/claude-code/") {
+    if script.contains("/@anthropic-ai/claude-code/") || script.contains("\\@anthropic-ai\\claude-code\\") {
         return Some("Claude".to_string());
     }
-    if script.contains("/@openai/codex/") {
+    if script.contains("/@openai/codex/") || script.contains("\\@openai\\codex\\") {
         return Some("Codex".to_string());
     }
-    if script.contains("/@google/gemini-cli/") {
+    if script.contains("/@google/gemini-cli/") || script.contains("\\@google\\gemini-cli\\") {
         return Some("Gemini".to_string());
     }
     let base = basename_lower(script);
@@ -59,7 +59,8 @@ pub fn agent_from_argv(argv: &[String]) -> Option<String> {
     known_agent(stem).map(str::to_string)
 }
 
-/// Inspect only the terminal's foreground process group on Linux (/proc).
+/// Inspect only the terminal's foreground process group on Linux (`/proc`).
+#[cfg(target_os = "linux")]
 pub fn foreground_agent(shell_pid: u32) -> Option<String> {
     if shell_pid == 0 {
         return None;
@@ -68,7 +69,6 @@ pub fn foreground_agent(shell_pid: u32) -> Option<String> {
     let rparen = stat_text.rfind(')')?;
     let after = stat_text.get(rparen + 2..)?;
     let fields: Vec<&str> = after.split_whitespace().collect();
-    // In /proc/<pid>/stat after "(comm) ", field[0]=state, [1]=ppid, [2]=pgrp, [3]=session, [4]=tty_nr, [5]=tpgid
     let tpgid: u32 = fields.get(5)?.parse().ok()?;
     if tpgid == 0 || tpgid == shell_pid {
         return None;
@@ -80,6 +80,38 @@ pub fn foreground_agent(shell_pid: u32) -> Option<String> {
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect();
     agent_from_argv(&argv)
+}
+
+/// Inspect foreground process group on macOS via `ps`.
+#[cfg(target_os = "macos")]
+pub fn foreground_agent(shell_pid: u32) -> Option<String> {
+    use std::process::Command;
+    if shell_pid == 0 {
+        return None;
+    }
+    let tpgid_out = Command::new("ps")
+        .args(["-o", "tpgid=", "-p", &shell_pid.to_string()])
+        .output()
+        .ok()?;
+    let tpgid: u32 = String::from_utf8_lossy(&tpgid_out.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    if tpgid == 0 || tpgid == shell_pid {
+        return None;
+    }
+    let args_out = Command::new("ps")
+        .args(["-o", "args=", "-p", &tpgid.to_string()])
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&args_out.stdout);
+    let argv: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    agent_from_argv(&argv)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn foreground_agent(_shell_pid: u32) -> Option<String> {
+    None
 }
 
 pub fn pi_copies_selection_on_select(cwd: Option<&str>) -> bool {

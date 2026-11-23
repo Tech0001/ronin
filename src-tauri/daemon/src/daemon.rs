@@ -8,16 +8,25 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use tokio::net::TcpListener;
 
 struct Peer {
     authenticated: bool,
@@ -147,12 +156,10 @@ fn flush_session(shared: &Arc<Mutex<DaemonState>>, id: u32) {
         if recipients.is_empty() {
             None
         } else {
-            serde_json::to_string(&event)
-                .ok()
-                .map(|mut s| {
-                    s.push('\n');
-                    (s, recipients)
-                })
+            serde_json::to_string(&event).ok().map(|mut s| {
+                s.push('\n');
+                (s, recipients)
+            })
         }
     };
     if let Some((line, recipients)) = payload {
@@ -163,6 +170,7 @@ fn flush_session(shared: &Arc<Mutex<DaemonState>>, id: u32) {
 }
 
 fn kill_session_process(session: &mut Session) {
+    #[cfg(unix)]
     if session.pid > 0 {
         unsafe {
             libc::kill(-(session.pid as libc::pid_t), libc::SIGHUP);
@@ -197,7 +205,6 @@ fn decode_utf8_stream(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
                     out.push('\u{FFFD}');
                     slice = &slice[valid_len + error_len..];
                 } else {
-                    // Incomplete multi-byte sequence at end of buffer — save for next chunk.
                     carry.extend_from_slice(&slice[valid_len..]);
                     break;
                 }
@@ -207,14 +214,29 @@ fn decode_utf8_stream(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     out
 }
 
+fn valid_shell_path(shell: &str) -> bool {
+    if shell.trim().is_empty() || shell.contains('\0') {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        shell.starts_with('/')
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
+}
+
 fn start_terminal(
     shared: &Arc<Mutex<DaemonState>>,
     req: StartTerminal,
 ) -> Result<RemoteTerminal, String> {
-    if req.id == 0 || req.cwd.is_empty() || !req.shell.starts_with('/') {
+    if req.id == 0 || req.cwd.is_empty() || !valid_shell_path(&req.shell) {
         return Err("Invalid terminal definition.".into());
     }
-    let meta = fs::metadata(&req.cwd).map_err(|_| "Working directory does not exist.".to_string())?;
+    let meta =
+        fs::metadata(&req.cwd).map_err(|_| "Working directory does not exist.".to_string())?;
     if !meta.is_dir() {
         return Err("Working directory is not a directory.".into());
     }
@@ -244,7 +266,10 @@ fn start_terminal(
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
     let mut cmd = CommandBuilder::new(&req.shell);
-    cmd.arg("-il");
+    #[cfg(unix)]
+    {
+        cmd.arg("-il");
+    }
     cmd.cwd(&req.cwd);
     cmd.env_clear();
     for (k, v) in &req.env {
@@ -357,7 +382,6 @@ fn pty_reader_loop(
         }
     }
 
-    // Flush any leftover invalid UTF-8 tail
     let tail = if !carry.is_empty() {
         String::from_utf8_lossy(&carry).into_owned()
     } else {
@@ -386,6 +410,7 @@ fn pty_reader_loop(
     broadcast_state(&shared);
 }
 
+#[cfg(unix)]
 fn acquire_daemon_lock(runtime_dir: &Path) -> Result<File, String> {
     let lock_path = runtime_dir.join("daemon.lock");
     let file = OpenOptions::new()
@@ -401,12 +426,27 @@ fn acquire_daemon_lock(runtime_dir: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-async fn handle_peer(
-    stream: UnixStream,
+#[cfg(windows)]
+fn acquire_daemon_lock(runtime_dir: &Path) -> Result<File, String> {
+    let lock_path = runtime_dir.join("daemon.lock");
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&lock_path)
+        .map_err(|_| "Another Ronin daemon instance is already running.".into())
+}
+
+async fn handle_peer_io<R, W>(
+    read_half: R,
+    mut write_half: W,
     shared: Arc<Mutex<DaemonState>>,
     shutdown_tx: mpsc::Sender<()>,
-) {
-    let (read_half, mut write_half) = stream.into_split();
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<String>(512);
     let peer_id = {
         let mut guard = shared.lock().unwrap();
@@ -629,7 +669,6 @@ fn process_request(
             )
         }
         DaemonOp::Attach { id } => {
-            // Unsubscribe first, flush any pending data to other peers, then serialize atomically.
             {
                 let mut guard = shared.lock().unwrap();
                 if let Some(peer) = guard.peers.get_mut(&peer_id) {
@@ -813,8 +852,101 @@ fn process_request(
     }
 }
 
+fn spawn_background_tasks(shared: &Arc<Mutex<DaemonState>>, shutdown_tx: &mpsc::Sender<()>) {
+    // 16ms output flush ticker
+    let flush_shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(16));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let ids: Vec<u32> = {
+                let guard = flush_shared.lock().unwrap();
+                if guard.closing.load(Ordering::Relaxed) {
+                    break;
+                }
+                guard
+                    .sessions
+                    .iter()
+                    .filter(|(_, s)| !s.pending.is_empty())
+                    .map(|(&id, _)| id)
+                    .collect()
+            };
+            for id in ids {
+                flush_session(&flush_shared, id);
+            }
+        }
+    });
+
+    // 800ms agent detection & idle shutdown ticker
+    let poll_shared = Arc::clone(shared);
+    let poll_shutdown = shutdown_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(800));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut idle_ticks = 0u32;
+        loop {
+            interval.tick().await;
+            let (closing, has_peers, running_pids): (bool, bool, Vec<(u32, u32)>) = {
+                let guard = poll_shared.lock().unwrap();
+                (
+                    guard.closing.load(Ordering::Relaxed),
+                    !guard.peers.is_empty(),
+                    guard
+                        .sessions
+                        .values()
+                        .filter(|s| s.running)
+                        .map(|s| (s.id, s.pid))
+                        .collect(),
+                )
+            };
+            if closing {
+                break;
+            }
+            if !has_peers && running_pids.is_empty() {
+                idle_ticks += 1;
+                if idle_ticks >= 15 {
+                    let _ = poll_shutdown.send(()).await;
+                    break;
+                }
+                continue;
+            }
+            idle_ticks = 0;
+
+            if running_pids.is_empty() {
+                continue;
+            }
+            let detected: Vec<(u32, Option<String>)> = tokio::task::spawn_blocking(move || {
+                running_pids
+                    .into_iter()
+                    .map(|(id, pid)| (id, foreground_agent(pid)))
+                    .collect()
+            })
+            .await
+            .unwrap_or_default();
+
+            let mut changed = false;
+            {
+                let mut guard = poll_shared.lock().unwrap();
+                for (id, agent) in detected {
+                    if let Some(session) = guard.sessions.get_mut(&id) {
+                        if session.running && session.agent != agent {
+                            session.agent = agent;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if changed {
+                broadcast_state(&poll_shared);
+            }
+        }
+    });
+}
+
 pub fn run_daemon(dir_arg: Option<String>) -> Result<(), String> {
     let runtime_dir = PathBuf::from(dir_arg.ok_or("Missing daemon runtime directory.")?);
+    #[cfg(unix)]
     unsafe {
         libc::umask(0o077);
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
@@ -822,7 +954,7 @@ pub fn run_daemon(dir_arg: Option<String>) -> Result<(), String> {
 
     let _lock_file = match acquire_daemon_lock(&runtime_dir) {
         Ok(f) => f,
-        Err(_) => return Ok(()), // Another daemon already holds the lock.
+        Err(_) => return Ok(()),
     };
 
     let token_path = runtime_dir.join("token");
@@ -837,9 +969,6 @@ pub fn run_daemon(dir_arg: Option<String>) -> Result<(), String> {
     let log_path = runtime_dir.join("daemon.log");
     let _ = fs::write(&log_path, "");
 
-    let socket_path = runtime_dir.join("service.sock");
-    let _ = fs::remove_file(&socket_path);
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -847,10 +976,6 @@ pub fn run_daemon(dir_arg: Option<String>) -> Result<(), String> {
         .map_err(|e| format!("Failed to start daemon runtime: {e}"))?;
 
     rt.block_on(async move {
-        let listener = UnixListener::bind(&socket_path)
-            .map_err(|e| format!("Failed to bind daemon socket: {e}"))?;
-        let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
-
         let shared = Arc::new(Mutex::new(DaemonState {
             sessions: HashMap::new(),
             peers: HashMap::new(),
@@ -865,138 +990,102 @@ pub fn run_daemon(dir_arg: Option<String>) -> Result<(), String> {
             .log(&format!("Ronin daemon started (pid={})", std::process::id()));
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(4);
+        spawn_background_tasks(&shared, &shutdown_tx);
 
-        // 16ms output flush ticker
-        let flush_shared = Arc::clone(&shared);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(16));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        #[cfg(unix)]
+        {
+            let socket_path = runtime_dir.join("service.sock");
+            let _ = fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path)
+                .map_err(|e| format!("Failed to bind daemon socket: {e}"))?;
+            let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
+
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
             loop {
-                interval.tick().await;
-                let ids: Vec<u32> = {
-                    let guard = flush_shared.lock().unwrap();
-                    if guard.closing.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    guard
-                        .sessions
-                        .iter()
-                        .filter(|(_, s)| !s.pending.is_empty())
-                        .map(|(&id, _)| id)
-                        .collect()
-                };
-                for id in ids {
-                    flush_session(&flush_shared, id);
-                }
-            }
-        });
-
-        // 800ms agent detection & idle shutdown ticker
-        let poll_shared = Arc::clone(&shared);
-        let poll_shutdown = shutdown_tx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(800));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut idle_ticks = 0u32;
-            loop {
-                interval.tick().await;
-                let (closing, has_peers, running_pids): (bool, bool, Vec<(u32, u32)>) = {
-                    let guard = poll_shared.lock().unwrap();
-                    (
-                        guard.closing.load(Ordering::Relaxed),
-                        !guard.peers.is_empty(),
-                        guard
-                            .sessions
-                            .values()
-                            .filter(|s| s.running)
-                            .map(|s| (s.id, s.pid))
-                            .collect(),
-                    )
-                };
-                if closing {
-                    break;
-                }
-                if !has_peers && running_pids.is_empty() {
-                    idle_ticks += 1;
-                    // Give a freshly-launched daemon ~12s grace before exiting when completely idle.
-                    if idle_ticks >= 15 {
-                        let _ = poll_shutdown.send(()).await;
-                        break;
-                    }
-                    continue;
-                }
-                idle_ticks = 0;
-
-                if running_pids.is_empty() {
-                    continue;
-                }
-                let detected: Vec<(u32, Option<String>)> = tokio::task::spawn_blocking(move || {
-                    running_pids
-                        .into_iter()
-                        .map(|(id, pid)| (id, foreground_agent(pid)))
-                        .collect()
-                })
-                .await
-                .unwrap_or_default();
-
-                let mut changed = false;
-                {
-                    let mut guard = poll_shared.lock().unwrap();
-                    for (id, agent) in detected {
-                        if let Some(session) = guard.sessions.get_mut(&id) {
-                            if session.running && session.agent != agent {
-                                session.agent = agent;
-                                changed = true;
-                            }
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        if let Ok((stream, _)) = accepted {
+                            let (r, w) = stream.into_split();
+                            let shared_peer = Arc::clone(&shared);
+                            let stx = shutdown_tx.clone();
+                            tokio::spawn(handle_peer_io(r, w, shared_peer, stx));
                         }
                     }
-                }
-                if changed {
-                    broadcast_state(&poll_shared);
-                }
-            }
-        });
-
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    if let Ok((stream, _)) = accepted {
-                        let shared_peer = Arc::clone(&shared);
-                        let stx = shutdown_tx.clone();
-                        tokio::spawn(handle_peer(stream, shared_peer, stx));
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    break;
-                }
-                _ = async {
-                    if let Some(ref mut s) = sigterm {
-                        s.recv().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    break;
+                    _ = shutdown_rx.recv() => break,
+                    _ = async {
+                        if let Some(ref mut s) = sigterm {
+                            s.recv().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => break,
                 }
             }
+
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.closing.store(true, Ordering::SeqCst);
+                for session in guard.sessions.values_mut() {
+                    if session.running {
+                        kill_session_process(session);
+                    }
+                }
+                guard.log("Ronin daemon shutting down.");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = fs::remove_file(&socket_path);
         }
 
-        // Clean shutdown
+        #[cfg(windows)]
         {
-            let mut guard = shared.lock().unwrap();
-            guard.closing.store(true, Ordering::SeqCst);
-            for session in guard.sessions.values_mut() {
-                if session.running {
-                    kill_session_process(session);
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| format!("Failed to bind daemon TCP loopback: {e}"))?;
+            let port = listener
+                .local_addr()
+                .map_err(|e| format!("Failed to read daemon port: {e}"))?
+                .port();
+            let port_path = runtime_dir.join("port");
+            let port_tmp = runtime_dir.join(format!("port.tmp.{}", std::process::id()));
+            fs::write(&port_tmp, port.to_string())
+                .map_err(|e| format!("Failed writing daemon port file: {e}"))?;
+            if fs::rename(&port_tmp, &port_path).is_err() {
+                fs::write(&port_path, port.to_string())
+                    .map_err(|e| format!("Failed publishing daemon port file: {e}"))?;
+                let _ = fs::remove_file(&port_tmp);
+            }
+
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        if let Ok((stream, _)) = accepted {
+                            let (r, w) = stream.into_split();
+                            let shared_peer = Arc::clone(&shared);
+                            let stx = shutdown_tx.clone();
+                            tokio::spawn(handle_peer_io(r, w, shared_peer, stx));
+                        }
+                    }
+                    _ = shutdown_rx.recv() => break,
+                    _ = tokio::signal::ctrl_c() => break,
                 }
             }
-            guard.log("Ronin daemon shutting down.");
+
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.closing.store(true, Ordering::SeqCst);
+                for session in guard.sessions.values_mut() {
+                    if session.running {
+                        kill_session_process(session);
+                    }
+                }
+                guard.log("Ronin daemon shutting down.");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = fs::remove_file(&port_path);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = fs::remove_file(&socket_path);
+
         Ok(())
     })
 }

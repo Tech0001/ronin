@@ -4,60 +4,87 @@ use ronin_daemon::protocol::{
 };
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use tokio::net::TcpStream;
 
 pub fn runtime_directory() -> PathBuf {
-    let uid = unsafe { libc::getuid() };
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let p = PathBuf::from(xdg).join("ronin-tty");
-        if p.parent().map(|parent| parent.exists()).unwrap_or(false) {
-            return p;
-        }
+    #[cfg(target_os = "macos")]
+    {
+        // Keep Unix socket path short (<104 bytes limit on macOS).
+        let uid = unsafe { libc::getuid() };
+        return PathBuf::from(format!("/tmp/ronin-tty-{uid}"));
     }
-    PathBuf::from(format!("/tmp/ronin-tty-{uid}"))
+    #[cfg(target_os = "linux")]
+    {
+        let uid = unsafe { libc::getuid() };
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            let p = PathBuf::from(xdg).join("ronin-tty");
+            if p.parent().map(|parent| parent.exists()).unwrap_or(false) {
+                return p;
+            }
+        }
+        return PathBuf::from(format!("/tmp/ronin-tty-{uid}"));
+    }
+    #[cfg(windows)]
+    {
+        return dirs::data_local_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("ronin-tty");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        std::env::temp_dir().join("ronin-tty")
+    }
 }
 
-fn read_random_hex(byte_len: usize) -> Result<String, String> {
-    let mut f = fs::File::open("/dev/urandom").map_err(|e| format!("urandom failed: {e}"))?;
-    let mut bytes = vec![0u8; byte_len];
-    f.read_exact(&mut bytes)
-        .map_err(|e| format!("urandom read failed: {e}"))?;
-    let mut out = String::with_capacity(byte_len * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    Ok(out)
+fn generate_token_64_hex() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
 fn prepare_runtime_dir(dir: &PathBuf) -> Result<String, String> {
-    let uid = unsafe { libc::getuid() };
     fs::create_dir_all(dir).map_err(|e| format!("Failed creating runtime dir: {e}"))?;
-    let meta = fs::symlink_metadata(dir).map_err(|e| format!("Failed stat runtime dir: {e}"))?;
-    if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
-        return Err("Unsafe terminal service runtime directory.".into());
+
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() };
+        let meta =
+            fs::symlink_metadata(dir).map_err(|e| format!("Failed stat runtime dir: {e}"))?;
+        if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
+            return Err("Unsafe terminal service runtime directory.".into());
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed chmod runtime dir: {e}"))?;
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("Failed chmod runtime dir: {e}"))?;
 
     let token_path = dir.join("token");
     if !token_path.exists() {
-        let candidate = dir.join(format!("token-{}", read_random_hex(12)?));
-        let token_value = read_random_hex(32)?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let candidate = dir.join(format!("token-{}", Uuid::new_v4().simple()));
+        let token_value = generate_token_64_hex();
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts
             .open(&candidate)
             .map_err(|e| format!("Failed creating temp token: {e}"))?;
         f.write_all(token_value.as_bytes())
@@ -67,15 +94,20 @@ fn prepare_runtime_dir(dir: &PathBuf) -> Result<String, String> {
         let _ = fs::remove_file(&candidate);
     }
 
-    let tmeta =
-        fs::symlink_metadata(&token_path).map_err(|e| format!("Failed stat token file: {e}"))?;
-    if !tmeta.is_file()
-        || tmeta.file_type().is_symlink()
-        || tmeta.uid() != uid
-        || (tmeta.mode() & 0o077) != 0
+    #[cfg(unix)]
     {
-        return Err("Unsafe terminal service token file.".into());
+        let uid = unsafe { libc::getuid() };
+        let tmeta =
+            fs::symlink_metadata(&token_path).map_err(|e| format!("Failed stat token file: {e}"))?;
+        if !tmeta.is_file()
+            || tmeta.file_type().is_symlink()
+            || tmeta.uid() != uid
+            || (tmeta.mode() & 0o077) != 0
+        {
+            return Err("Unsafe terminal service token file.".into());
+        }
     }
+
     let token = fs::read_to_string(&token_path)
         .map_err(|e| format!("Failed reading token: {e}"))?
         .trim()
@@ -88,18 +120,19 @@ fn prepare_runtime_dir(dir: &PathBuf) -> Result<String, String> {
 
 fn resolve_daemon_binary() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
-    let sibling = exe.with_file_name("ronin-daemon");
+    let bin_name = format!("ronin-daemon{}", std::env::consts::EXE_SUFFIX);
+    let sibling = exe.with_file_name(&bin_name);
     if sibling.is_file() {
         return Ok(sibling);
     }
     if let Some(home) = dirs::home_dir() {
-        let local = home.join(".local/bin/ronin-daemon");
+        let local = home.join(".local/bin").join(&bin_name);
         if local.is_file() {
             return Ok(local);
         }
     }
     Err(format!(
-        "ronin-daemon binary not found next to {}",
+        "{bin_name} binary not found next to {}",
         exe.display()
     ))
 }
@@ -108,67 +141,116 @@ fn spawn_detached_daemon(dir: &PathBuf) -> Result<(), String> {
     let exe = resolve_daemon_binary()?;
     let dir_str = dir.to_string_lossy().to_string();
 
-    // Prefer launching the daemon inside its own systemd user scope so GUI crashes
-    // or OOM kills in another scope cannot take down running agent terminals.
-    let unit = format!("ronin-daemon-{}", read_random_hex(4).unwrap_or_else(|_| "tty".into()));
-    let mut systemd_cmd = Command::new("systemd-run");
-    systemd_cmd
-        .args([
-            "--user",
-            "--scope",
-            "--quiet",
-            "--collect",
-            &format!("--unit={unit}"),
-            "--",
-        ])
-        .arg(&exe)
-        .arg("--daemon")
-        .arg(&dir_str)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .current_dir("/tmp");
-    unsafe {
-        systemd_cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    if let Ok(mut child) = systemd_cmd.spawn() {
-        // Check quickly whether systemd-run failed immediately (e.g. no user bus).
-        std::thread::sleep(Duration::from_millis(40));
-        match child.try_wait() {
-            Ok(Some(status)) if !status.success() => {}
-            _ => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Ok(());
+    #[cfg(target_os = "linux")]
+    {
+        // Prefer launching the daemon inside its own systemd user scope so GUI crashes
+        // or OOM kills in another scope cannot take down running agent terminals.
+        let unit = format!("ronin-daemon-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let mut systemd_cmd = Command::new("systemd-run");
+        systemd_cmd
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                &format!("--unit={unit}"),
+                "--",
+            ])
+            .arg(&exe)
+            .arg("--daemon")
+            .arg(&dir_str)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir(std::env::temp_dir());
+        unsafe {
+            systemd_cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        if let Ok(mut child) = systemd_cmd.spawn() {
+            std::thread::sleep(Duration::from_millis(40));
+            match child.try_wait() {
+                Ok(Some(status)) if !status.success() => {}
+                _ => {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return Ok(());
+                }
             }
         }
     }
 
-    // Fallback: spawn detached daemon directly in a new session (setsid).
     let mut cmd = Command::new(&exe);
     cmd.arg("--daemon")
         .arg(&dir_str)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .current_dir("/tmp");
+        .current_dir(std::env::temp_dir());
+
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
             Ok(())
         });
     }
-    let mut fallback = cmd
+
+    #[cfg(windows)]
+    {
+        // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW
+        cmd.creation_flags(0x0000_0200 | 0x0000_0008 | 0x0800_0000);
+    }
+
+    let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed spawning daemon fallback: {e}"))?;
+        .map_err(|e| format!("Failed spawning daemon: {e}"))?;
     std::thread::spawn(move || {
-        let _ = fallback.wait();
+        let _ = child.wait();
     });
     Ok(())
+}
+
+#[cfg(unix)]
+async fn connect_transport(
+    dir: &PathBuf,
+) -> Result<
+    (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ),
+    String,
+> {
+    let stream = UnixStream::connect(dir.join("service.sock"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let (r, w) = stream.into_split();
+    Ok((Box::new(r), Box::new(w)))
+}
+
+#[cfg(windows)]
+async fn connect_transport(
+    dir: &PathBuf,
+) -> Result<
+    (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ),
+    String,
+> {
+    let port_text = fs::read_to_string(dir.join("port")).map_err(|e| e.to_string())?;
+    let port: u16 = port_text
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid daemon port".to_string())?;
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| e.to_string())?;
+    let (r, w) = stream.into_split();
+    Ok((Box::new(r), Box::new(w)))
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
@@ -234,31 +316,29 @@ impl DaemonClient {
         }
 
         let token = prepare_runtime_dir(&self.runtime_dir)?;
-        let sock_path = self.runtime_dir.join("service.sock");
 
-        let stream = match UnixStream::connect(&sock_path).await {
-            Ok(s) => s,
+        let (read_half, mut write_half) = match connect_transport(&self.runtime_dir).await {
+            Ok(pair) => pair,
             Err(_) => {
                 spawn_detached_daemon(&self.runtime_dir)?;
-                let mut connected_stream = None;
+                let mut connected_pair = None;
                 for i in 0..60 {
                     tokio::time::sleep(Duration::from_millis(80)).await;
-                    if let Ok(s) = UnixStream::connect(&sock_path).await {
-                        connected_stream = Some(s);
+                    if let Ok(pair) = connect_transport(&self.runtime_dir).await {
+                        connected_pair = Some(pair);
                         break;
                     }
                     if i == 15 || i == 35 {
                         let _ = spawn_detached_daemon(&self.runtime_dir);
                     }
                 }
-                connected_stream.ok_or_else(|| {
+                connected_pair.ok_or_else(|| {
                     "Background terminal service did not start. Existing sessions were not stopped."
                         .to_string()
                 })?
             }
         };
 
-        let (read_half, mut write_half) = stream.into_split();
         let (tx, mut rx) = mpsc::channel::<String>(512);
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -337,7 +417,6 @@ impl DaemonClient {
                 }
             }
 
-            // Connection lost
             let was_connected = conn_slot.lock().unwrap().take().is_some();
             let waiters: Vec<_> = pending_reader
                 .lock()
@@ -356,7 +435,6 @@ impl DaemonClient {
             }
         });
 
-        // Authenticate with hello before publishing connection
         let rid = self.counter.fetch_add(1, Ordering::Relaxed);
         let (resp_tx, resp_rx) = oneshot::channel();
         pending.lock().unwrap().insert(rid, resp_tx);

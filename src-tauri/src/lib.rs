@@ -48,6 +48,17 @@ struct DaemonStatus {
     runtime_dir: String,
 }
 
+fn platform_default_shell() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".into())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
+    }
+}
+
 #[tauri::command]
 async fn app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
     let workspace = state.workspace.lock().unwrap().clone();
@@ -59,7 +70,7 @@ async fn app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, S
     let home_dir = dirs::home_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".into());
-    let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let default_shell = platform_default_shell();
 
     Ok(BootstrapPayload {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -116,7 +127,7 @@ async fn terminal_start(
     let shell = if !shell_setting.is_empty() {
         shell_setting
     } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
+        platform_default_shell()
     };
     let env: HashMap<String, String> = std::env::vars().collect();
     state

@@ -24,7 +24,6 @@ custom-protocol = ["tauri/custom-protocol"]
 [dependencies]
 base64 = "0.22"
 dirs = "6"
-libc = "0.2"
 notify = "8.2.0"
 ronin-daemon = { path = "daemon" }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +31,10 @@ serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 codegen-units = 1

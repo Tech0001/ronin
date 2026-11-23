@@ -58,20 +58,22 @@ Ronin watches `~/.local/state/omarchy/current/theme/colors.toml` and updates UI 
 | Open file preview / external | `Ctrl+click` · `Ctrl+Shift+click` |
 | Settings & daemon controls | `Ctrl+,` |
 
-## Install from Release (Linux x86_64)
+## Install from Release
 
 Download from [GitHub Releases](https://github.com/Tech0001/ronin/releases):
 
-- **Arch / Omarchy:**
+- **Linux (Arch / Omarchy):**
   ```bash
   sudo pacman -U ronin-1.1.0-1-x86_64.pkg.tar.zst
   ```
-- **Portable user-local install (any Linux distro with `webkit2gtk-4.1`):**
+- **Linux (Debian / Ubuntu):** install the `.deb` package, or use the portable tarball:
   ```bash
   tar -xzf ronin-1.1.0-linux-x86_64.tar.gz
   cd ronin-1.1.0-linux-x86_64
   ./install.sh
   ```
+- **macOS (Apple Silicon & Intel):** open the `.dmg` and drag **Ronin** to Applications.
+- **Windows (x64):** run the `.exe` (NSIS) or `.msi` installer.
 
 ## Build from Source
 

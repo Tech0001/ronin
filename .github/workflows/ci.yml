@@ -1,22 +1,36 @@
-name: CI & Release
+name: CI
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
-    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  test-and-build:
-    runs-on: ubuntu-24.04
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: Linux (x64)
+          - os: macos-latest
+            name: macOS (arm64)
+          - os: windows-latest
+            name: Windows (x64)
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux GTK / WebKitGTK dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -44,28 +58,5 @@ jobs:
       - name: Build frontend and run unit tests
         run: npm run build && npm test
 
-      - name: Run Rust workspace tests
+      - name: Run Rust workspace & PTY daemon tests
         run: cargo test --workspace --manifest-path src-tauri/Cargo.toml
-
-      - name: Build and package Linux release
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          npm run build:release
-          npm run package:linux
-
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" --clobber \
-              release/ronin-*.tar.gz \
-              release/SHA256SUMS.txt
-          else
-            gh release create "${GITHUB_REF_NAME}" \
-              --title "Ronin ${GITHUB_REF_NAME}" \
-              --generate-notes \
-              release/ronin-*.tar.gz \
-              release/SHA256SUMS.txt
-          fi

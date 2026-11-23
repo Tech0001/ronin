@@ -1,15 +1,22 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn send_rpc(
-    reader: &mut BufReader<UnixStream>,
-    writer: &mut UnixStream,
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
+#[cfg(windows)]
+use std::net::TcpStream;
+
+fn send_rpc<R: Read, W: Write>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
     rid: u64,
     payload: Value,
 ) -> Value {
@@ -20,7 +27,7 @@ fn send_rpc(
     writer.write_all(line.as_bytes()).unwrap();
     writer.flush().unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         assert!(Instant::now() < deadline, "Timed out waiting for RPC rid={rid}");
         let mut buf = String::new();
@@ -33,6 +40,24 @@ fn send_rpc(
     }
 }
 
+#[cfg(unix)]
+fn connect_daemon(runtime_dir: &Path) -> Option<(BufReader<UnixStream>, UnixStream)> {
+    let stream = UnixStream::connect(runtime_dir.join("service.sock")).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
+    let writer = stream.try_clone().ok()?;
+    Some((BufReader::new(stream), writer))
+}
+
+#[cfg(windows)]
+fn connect_daemon(runtime_dir: &Path) -> Option<(BufReader<TcpStream>, TcpStream)> {
+    let port_text = fs::read_to_string(runtime_dir.join("port")).ok()?;
+    let port: u16 = port_text.trim().parse().ok()?;
+    let stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
+    let writer = stream.try_clone().ok()?;
+    Some((BufReader::new(stream), writer))
+}
+
 #[test]
 fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
     let bin = env!("CARGO_BIN_EXE_ronin-daemon");
@@ -42,18 +67,30 @@ fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&runtime_dir).unwrap();
+    #[cfg(unix)]
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
 
     let token = "a".repeat(64);
     let token_path = runtime_dir.join("token");
-    let mut tf = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&token_path)
-        .unwrap();
-    tf.write_all(token.as_bytes()).unwrap();
-    drop(tf);
+    #[cfg(unix)]
+    {
+        let mut tf = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&token_path)
+            .unwrap();
+        tf.write_all(token.as_bytes()).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let mut tf = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&token_path)
+            .unwrap();
+        tf.write_all(token.as_bytes()).unwrap();
+    }
 
     let mut child = Command::new(bin)
         .arg("--daemon")
@@ -62,21 +99,17 @@ fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn ronin --daemon");
+        .expect("spawn ronin-daemon");
 
-    let sock_path = runtime_dir.join("service.sock");
-    let mut stream = None;
-    for _ in 0..50 {
-        if let Ok(s) = UnixStream::connect(&sock_path) {
-            stream = Some(s);
+    let mut conn = None;
+    for _ in 0..80 {
+        if let Some(c) = connect_daemon(&runtime_dir) {
+            conn = Some(c);
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let stream = stream.expect("connect to daemon socket");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
+    let (mut reader, mut writer) = conn.expect("connect to daemon");
 
     // 1. Authenticate
     let hello = send_rpc(
@@ -87,10 +120,19 @@ fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
     );
     assert!(hello.get("error").is_none(), "hello failed: {hello}");
 
-    // 2. Start PTY running /bin/sh (or /bin/bash)
-    let mut env_map = HashMap::new();
-    env_map.insert("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin".to_string());
-    env_map.insert("HOME".to_string(), "/tmp".to_string());
+    // 2. Start PTY running platform shell
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+    let mut env_map: HashMap<String, String> = std::env::vars().collect();
+    #[cfg(unix)]
+    let (shell, write_cmd) = (
+        "/bin/sh",
+        "printf '\\033[?1006hRONIN_PERSIST_MARKER_42\\n'\r",
+    );
+    #[cfg(windows)]
+    let (shell, write_cmd) = ("cmd.exe", "echo RONIN_PERSIST_MARKER_42\r\n");
+
+    env_map.entry("TERM".into()).or_insert_with(|| "xterm-256color".into());
+
     let started = send_rpc(
         &mut reader,
         &mut writer,
@@ -99,8 +141,8 @@ fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
             "op": "start",
             "value": {
                 "id": 1,
-                "cwd": "/tmp",
-                "shell": "/bin/bash",
+                "cwd": cwd,
+                "shell": shell,
                 "env": env_map,
                 "cols": 80,
                 "rows": 24
@@ -110,7 +152,7 @@ fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
     assert!(started.get("error").is_none(), "start failed: {started}");
     assert_eq!(started["value"]["running"], json!(true));
 
-    // 3. Write unique marker + enable SGR mouse encoding 1006
+    // 3. Write unique marker
     let write_res = send_rpc(
         &mut reader,
         &mut writer,
@@ -118,22 +160,19 @@ fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
         json!({
             "op": "write",
             "id": 1,
-            "data": "printf '\\033[?1006hRONIN_PERSIST_MARKER_42\\n'\r"
+            "data": write_cmd
         }),
     );
     assert!(write_res.get("error").is_none());
-    std::thread::sleep(Duration::from_millis(350));
+    std::thread::sleep(Duration::from_millis(500));
 
     // 4. Disconnect first client completely!
     drop(reader);
     drop(writer);
-    std::thread::sleep(Duration::from_millis(120));
+    std::thread::sleep(Duration::from_millis(150));
 
-    // 5. Reconnect fresh client and verify session survived + snapshot contains marker & ?1006h
-    let stream2 = UnixStream::connect(&sock_path).expect("reconnect to daemon");
-    stream2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut writer2 = stream2.try_clone().unwrap();
-    let mut reader2 = BufReader::new(stream2);
+    // 5. Reconnect fresh client and verify session survived + snapshot contains marker
+    let (mut reader2, mut writer2) = connect_daemon(&runtime_dir).expect("reconnect to daemon");
 
     let hello2 = send_rpc(
         &mut reader2,
@@ -150,6 +189,7 @@ fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
         replay.contains("RONIN_PERSIST_MARKER_42"),
         "expected marker in replay, got: {replay:?}"
     );
+    #[cfg(unix)]
     assert!(
         replay.contains("\x1b[?1006h"),
         "expected SGR mouse encoding ?1006h in replay"
