@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { AppSettings, DaemonStatus, Lane, ThemePalette } from '../types';
+import type { AppSettings, CanvasTab, DaemonStatus, Lane, ThemePalette } from '../types';
 import { api } from '../lib/api';
 import { baseName, shortenHome } from '../lib/terminalFiles';
 import { Icon } from './Icon';
@@ -8,6 +8,8 @@ export function LaneModal({
   mode,
   initialKind,
   initialCwd,
+  initialTabId,
+  tabs,
   lane,
   folders,
   homeDir,
@@ -17,6 +19,8 @@ export function LaneModal({
   mode: 'create' | 'edit';
   initialKind: 'terminal' | 'agent';
   initialCwd: string;
+  initialTabId: string;
+  tabs: CanvasTab[];
   lane?: Lane;
   folders: string[];
   homeDir: string;
@@ -25,6 +29,8 @@ export function LaneModal({
     kind: 'terminal' | 'agent';
     command: string;
     cwd: string;
+    projectDir?: string;
+    tabId: string;
   }) => Promise<void>;
   onClose: () => void;
 }) {
@@ -34,6 +40,8 @@ export function LaneModal({
   const [kind, setKind] = useState<'terminal' | 'agent'>(lane?.kind ?? initialKind);
   const [command, setCommand] = useState(lane?.command ?? '');
   const [cwd, setCwd] = useState(lane?.cwd ?? initialCwd);
+  const [projectDir, setProjectDir] = useState(lane?.projectDir ?? '');
+  const [tabId, setTabId] = useState(lane?.tabId ?? initialTabId);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -55,6 +63,7 @@ export function LaneModal({
     e.preventDefault();
     const trimmedName = name.trim();
     const trimmedCwd = cwd.trim();
+    const trimmedProject = projectDir.trim();
     if (!trimmedName) {
       setError('Enter a name for this lane.');
       return;
@@ -64,9 +73,23 @@ export function LaneModal({
       setError('Working directory does not exist or is not a folder.');
       return;
     }
+    if (trimmedProject) {
+      const okProj = await api.isDir(trimmedProject).catch(() => false);
+      if (!okProj) {
+        setError('Project repo folder does not exist or is not a folder.');
+        return;
+      }
+    }
     setSaving(true);
     try {
-      await onSave({ name: trimmedName, kind, command: command.trim(), cwd: trimmedCwd });
+      await onSave({
+        name: trimmedName,
+        kind,
+        command: command.trim(),
+        cwd: trimmedCwd,
+        projectDir: trimmedProject || undefined,
+        tabId,
+      });
       onClose();
     } catch (err) {
       setError(String(err));
@@ -186,6 +209,68 @@ export function LaneModal({
               </div>
             )}
           </label>
+
+          <label className="field">
+            <span>
+              Project repo folder (optional — shows git branch &amp; resolves links when agent runs
+              from a separate folder)
+            </span>
+            <div className="input-with-btn">
+              <input
+                value={projectDir}
+                placeholder="Same as working directory"
+                onChange={(e) => setProjectDir(e.target.value)}
+              />
+              {projectDir && (
+                <button type="button" onClick={() => setProjectDir('')}>
+                  Clear
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  void api.pickFolder(projectDir || folders[0] || homeDir).then((picked) => {
+                    if (picked) setProjectDir(picked);
+                  });
+                }}
+              >
+                Browse…
+              </button>
+            </div>
+            {folders.length > 0 && (
+              <div className="chip-row">
+                {folders.map((folder) => (
+                  <button
+                    key={folder}
+                    type="button"
+                    className={`chip${projectDir === folder ? ' active' : ''}`}
+                    title={folder}
+                    onClick={() => setProjectDir(projectDir === folder ? '' : folder)}
+                  >
+                    {baseName(folder)}
+                  </button>
+                ))}
+              </div>
+            )}
+          </label>
+
+          {tabs.length > 1 && (
+            <div className="field">
+              <span>Canvas tab</span>
+              <div className="segmented">
+                {tabs.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={tabId === t.id ? 'active' : ''}
+                    onClick={() => setTabId(t.id)}
+                  >
+                    {t.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {error && <div className="form-error">{error}</div>}
         </div>

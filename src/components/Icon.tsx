@@ -111,6 +111,20 @@ const PATHS = {
     <path d="M6.5 6.5a2 2 0 1 1 2-2v11a2 2 0 1 1-2-2h7a2 2 0 1 1-2 2v-11a2 2 0 1 1 2 2h-7Z" />
   ),
   trash: <path d="M3.5 5.5h13M7.5 5.5V3h5v2.5M5.5 5.5l.8 11.5h7.4l.8-11.5M8.5 8.5v5.5m3-5.5v5.5" />,
+  branch: (
+    <>
+      <circle cx="6" cy="4.8" r="2" />
+      <circle cx="6" cy="15.2" r="2" />
+      <circle cx="14.2" cy="7.5" r="2" />
+      <path d="M6 6.8v6.4m0-2.2c0-2 2.2-3.5 6.2-3.5" />
+    </>
+  ),
+  save: (
+    <>
+      <path d="M4 3.5h9.5l3 3V16a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Z" />
+      <path d="M6.5 3.5v4.5h6V3.5M6.5 17v-5h7v5" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof PATHS;

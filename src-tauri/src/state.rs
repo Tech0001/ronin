@@ -2,6 +2,24 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+fn default_tab_id() -> String {
+    "main".into()
+}
+
+fn default_tabs() -> Vec<CanvasTab> {
+    vec![CanvasTab {
+        id: default_tab_id(),
+        name: "Main".into(),
+    }]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasTab {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lane {
@@ -10,6 +28,10 @@ pub struct Lane {
     pub kind: String,
     pub command: String,
     pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<String>,
+    #[serde(default = "default_tab_id")]
+    pub tab_id: String,
     pub x: f64,
     pub y: f64,
     pub width: f64,
@@ -94,6 +116,10 @@ impl Default for AppSettings {
 pub struct WorkspaceState {
     #[serde(default)]
     pub folders: Vec<String>,
+    #[serde(default = "default_tabs")]
+    pub tabs: Vec<CanvasTab>,
+    #[serde(default = "default_tab_id")]
+    pub active_tab_id: String,
     #[serde(default)]
     pub lanes: Vec<Lane>,
     #[serde(default)]
@@ -120,6 +146,8 @@ impl Default for WorkspaceState {
     fn default() -> Self {
         Self {
             folders: Vec::new(),
+            tabs: default_tabs(),
+            active_tab_id: default_tab_id(),
             lanes: Vec::new(),
             columns: 0,
             auto_fit: true,

@@ -13,6 +13,7 @@ export function FilePreviewModal({
   onClose,
   onOpenExternal,
   onOpenRelated,
+  onSaved,
 }: {
   request: PreviewRequest;
   data?: FilePreviewResult;
@@ -20,23 +21,32 @@ export function FilePreviewModal({
   onClose: () => void;
   onOpenExternal: (target: string, cwd?: string) => void;
   onOpenRelated: (path: string, cwd?: string) => void;
+  onSaved: (path: string, nextContent: string) => void;
 }) {
   const selectedLineRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
   const [imageError, setImageError] = useState(false);
   const [copiedPath, setCopiedPath] = useState(false);
   const [viewMode, setViewMode] = useState<'rendered' | 'source'>('rendered');
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [activeMatchIdx, setActiveMatchIdx] = useState(0);
 
   const isRich = data?.kind === 'html' || data?.kind === 'markdown';
+  const canEdit = Boolean(data?.editable && data.content !== undefined);
+  const isDirty = editing && draft !== (data?.content ?? '');
 
   useEffect(() => {
     setImageError(false);
     setFindQuery('');
     setActiveMatchIdx(0);
-    // Jump directly to Source if a specific line was requested on a markdown/HTML file.
+    setEditing(false);
+    setSaveError(null);
     if (data?.kind === 'html' || data?.kind === 'markdown') {
       setViewMode(data.line ? 'source' : 'rendered');
     } else {
@@ -44,11 +54,26 @@ export function FilePreviewModal({
     }
   }, [request.requestId, data?.kind, data?.line]);
 
+  const handleSave = async () => {
+    if (!data?.path || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await api.writeFile(data.path, draft);
+      onSaved(data.path, draft);
+      setEditing(false);
+    } catch (err) {
+      setSaveError(String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   useEffect(() => {
-    if (viewMode === 'source' && selectedLineRef.current) {
+    if (!editing && viewMode === 'source' && selectedLineRef.current) {
       selectedLineRef.current.scrollIntoView({ block: 'center' });
     }
-  }, [data, viewMode]);
+  }, [data, viewMode, editing]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -58,12 +83,26 @@ export function FilePreviewModal({
         if (findOpen) {
           setFindOpen(false);
           setFindQuery('');
+        } else if (editing) {
+          setEditing(false);
+          setSaveError(null);
         } else {
           onClose();
         }
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' && data?.content !== undefined) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && editing) {
+        e.preventDefault();
+        e.stopPropagation();
+        void handleSave();
+        return;
+      }
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        e.key.toLowerCase() === 'f' &&
+        data?.content !== undefined &&
+        !editing
+      ) {
         e.preventDefault();
         e.stopPropagation();
         setViewMode('source');
@@ -73,7 +112,7 @@ export function FilePreviewModal({
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [findOpen, onClose, data?.content]);
+  }, [findOpen, editing, draft, saving, onClose, data?.content, data?.path]);
 
   const lines = useMemo(
     () => (data?.content !== undefined ? data.content.split(/\r?\n/) : []),
@@ -156,55 +195,93 @@ export function FilePreviewModal({
           </div>
 
           <div className="preview-actions">
-            {isRich && (
-              <div className="segmented" role="group" aria-label="View mode">
+            {editing ? (
+              <>
                 <button
-                  className={viewMode === 'rendered' ? 'active' : ''}
-                  onClick={() => setViewMode('rendered')}
-                  title="Rendered preview"
+                  className="btn-accent"
+                  disabled={saving || !isDirty}
+                  onClick={() => void handleSave()}
+                  title="Save file (Ctrl+S)"
                 >
-                  <Icon name="eye" size={13} />
-                  Preview
+                  <Icon name="save" size={13} />
+                  {saving ? 'Saving…' : 'Save'}
                 </button>
                 <button
-                  className={viewMode === 'source' ? 'active' : ''}
-                  onClick={() => setViewMode('source')}
-                  title="View source with line numbers"
+                  onClick={() => {
+                    setEditing(false);
+                    setSaveError(null);
+                  }}
                 >
-                  <Icon name="code" size={13} />
-                  Source
+                  Cancel
                 </button>
-              </div>
+              </>
+            ) : (
+              <>
+                {isRich && (
+                  <div className="segmented" role="group" aria-label="View mode">
+                    <button
+                      className={viewMode === 'rendered' ? 'active' : ''}
+                      onClick={() => setViewMode('rendered')}
+                      title="Rendered preview"
+                    >
+                      <Icon name="eye" size={13} />
+                      Preview
+                    </button>
+                    <button
+                      className={viewMode === 'source' ? 'active' : ''}
+                      onClick={() => setViewMode('source')}
+                      title="View source with line numbers"
+                    >
+                      <Icon name="code" size={13} />
+                      Source
+                    </button>
+                  </div>
+                )}
+                {canEdit && (
+                  <button
+                    onClick={() => {
+                      setDraft(data?.content ?? '');
+                      setFindOpen(false);
+                      setEditing(true);
+                      requestAnimationFrame(() => editorRef.current?.focus());
+                    }}
+                    title="Quick-edit this file (Ctrl+S to save)"
+                  >
+                    <Icon name="edit" size={13} />
+                    Edit
+                  </button>
+                )}
+                {data?.content !== undefined && (
+                  <button
+                    className={`icon-btn${findOpen ? ' active' : ''}`}
+                    title="Find in file (Ctrl+F)"
+                    aria-label="Find in file"
+                    onClick={() => {
+                      setViewMode('source');
+                      setFindOpen((v) => !v);
+                      requestAnimationFrame(() => searchInputRef.current?.focus());
+                    }}
+                  >
+                    <Icon name="search" size={14} />
+                  </button>
+                )}
+                <button onClick={copyPath} title="Copy file path">
+                  <Icon name="copy" size={13} />
+                  {copiedPath ? 'Copied' : 'Copy path'}
+                </button>
+                <button
+                  onClick={() => onOpenExternal(displayPath, request.cwd)}
+                  title={
+                    data?.kind === 'html'
+                      ? 'Open in default browser'
+                      : 'Open with default external application'
+                  }
+                >
+                  <Icon name="external" size={13} />
+                  {data?.kind === 'html' ? 'Open in Browser' : 'Open externally'}
+                </button>
+              </>
             )}
-            {data?.content !== undefined && (
-              <button
-                className={`icon-btn${findOpen ? ' active' : ''}`}
-                title="Find in file (Ctrl+F)"
-                aria-label="Find in file"
-                onClick={() => {
-                  setViewMode('source');
-                  setFindOpen((v) => !v);
-                  requestAnimationFrame(() => searchInputRef.current?.focus());
-                }}
-              >
-                <Icon name="search" size={14} />
-              </button>
-            )}
-            <button onClick={copyPath} title="Copy file path">
-              <Icon name="copy" size={13} />
-              {copiedPath ? 'Copied' : 'Copy path'}
-            </button>
-            <button
-              onClick={() => onOpenExternal(displayPath, request.cwd)}
-              title={
-                data?.kind === 'html'
-                  ? 'Open in default browser'
-                  : 'Open with default external application'
-              }
-            >
-              <Icon name="external" size={13} />
-              {data?.kind === 'html' ? 'Open in Browser' : 'Open externally'}
-            </button>
             <button
               autoFocus
               className="icon-btn"
@@ -216,6 +293,12 @@ export function FilePreviewModal({
             </button>
           </div>
         </header>
+
+        {saveError && (
+          <div className="preview-banner error" role="alert">
+            {saveError}
+          </div>
+        )}
 
         {findOpen && data?.content !== undefined && (
           <div className="preview-findbar">
@@ -300,7 +383,37 @@ export function FilePreviewModal({
             />
           ))}
 
-        {data?.kind === 'html' && data.content !== undefined && viewMode === 'rendered' && (
+        {editing && (
+          <div className="preview-editor-wrap">
+            <div className="preview-subbar">
+              <span className="preview-help">
+                {isDirty ? 'Unsaved changes · ' : ''}Ctrl+S to save · Escape to cancel
+              </span>
+            </div>
+            <textarea
+              ref={editorRef}
+              className="preview-editor"
+              spellCheck={false}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Tab') {
+                  e.preventDefault();
+                  const el = e.currentTarget;
+                  const start = el.selectionStart;
+                  const end = el.selectionEnd;
+                  const next = draft.slice(0, start) + '  ' + draft.slice(end);
+                  setDraft(next);
+                  requestAnimationFrame(() => {
+                    el.selectionStart = el.selectionEnd = start + 2;
+                  });
+                }
+              }}
+            />
+          </div>
+        )}
+
+        {!editing && data?.kind === 'html' && data.content !== undefined && viewMode === 'rendered' && (
           <div className="preview-html-wrap">
             <div className="preview-subbar">
               <span className="preview-help">
@@ -317,13 +430,13 @@ export function FilePreviewModal({
           </div>
         )}
 
-        {data?.kind === 'markdown' && data.content !== undefined && viewMode === 'rendered' && (
+        {!editing && data?.kind === 'markdown' && data.content !== undefined && viewMode === 'rendered' && (
           <div className="preview-markdown" tabIndex={0}>
             {renderMarkdownDocument(data.content, handleMarkdownLink)}
           </div>
         )}
 
-        {data?.content !== undefined && (!isRich || viewMode === 'source') && (
+        {!editing && data?.content !== undefined && (!isRich || viewMode === 'source') && (
           <div className="preview-code" tabIndex={0} aria-label="File contents">
             {lines.map((lineText, idx) => {
               const lineNum = (data.startLine ?? 1) + idx;

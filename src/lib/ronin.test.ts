@@ -152,6 +152,24 @@ describe('terminalFiles & shortcuts', () => {
         false,
       ),
     ).toBe('find');
+    expect(
+      terminalShortcut(
+        { key: 'ArrowRight', shiftKey: false, ctrlKey: true, metaKey: false, altKey: true },
+        false,
+      ),
+    ).toBe('paneNav');
+    expect(
+      terminalShortcut(
+        { key: 'm', shiftKey: false, ctrlKey: true, metaKey: false, altKey: true },
+        false,
+      ),
+    ).toBe('paneNav');
+    expect(
+      terminalShortcut(
+        { key: '3', shiftKey: false, ctrlKey: true, metaKey: false, altKey: true },
+        false,
+      ),
+    ).toBe('paneNav');
   });
 
   it('tokenizes rust keywords and comments', () => {

@@ -11,7 +11,8 @@ export type TerminalShortcutAction =
   | 'zoomIn'
   | 'zoomOut'
   | 'zoomReset'
-  | 'find';
+  | 'find'
+  | 'paneNav';
 
 export function terminalShortcut(
   event: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'shiftKey' | 'altKey'> & {
@@ -20,8 +21,18 @@ export function terminalShortcut(
   mac: boolean,
 ): TerminalShortcutAction | null {
   const key = event.key.toLowerCase();
-  if (event.ctrlKey && event.altKey && !event.metaKey && !event.shiftKey && key === 'f') {
-    return 'find';
+  if (event.ctrlKey && event.altKey && !event.metaKey && !event.shiftKey) {
+    if (key === 'f') return 'find';
+    if (
+      key === 'm' ||
+      key === 'arrowleft' ||
+      key === 'arrowright' ||
+      key === 'arrowup' ||
+      key === 'arrowdown' ||
+      /^[1-9]$/.test(key)
+    ) {
+      return 'paneNav';
+    }
   }
   if (event.altKey) return null;
   if (key === 'escape' && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.isComposing) {

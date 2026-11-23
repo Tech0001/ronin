@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type {
+  CanvasTab,
   DirEntryItem,
   Lane,
   RemoteTerminal,
@@ -174,6 +175,7 @@ function ExplorerNode({
 
 function ExplorerRoot({
   rootPath,
+  branch,
   homeDir,
   showHidden,
   refreshTick,
@@ -183,6 +185,7 @@ function ExplorerRoot({
   onNewTerminalInDir,
 }: {
   rootPath: string;
+  branch?: string;
   homeDir: string;
   showHidden: boolean;
   refreshTick: number;
@@ -228,6 +231,12 @@ function ExplorerRoot({
       >
         <Icon name={expanded ? 'chevronDown' : 'chevronRight'} size={13} />
         <strong className="root-name">{baseName(rootPath)}</strong>
+        {branch && (
+          <span className="git-branch-pill root" title={`Git branch: ${branch}`}>
+            <Icon name="branch" size={10} />
+            {branch}
+          </span>
+        )}
         <span className="row-actions" onClick={(e) => e.stopPropagation()}>
           <button
             className="icon-btn xs"
@@ -268,6 +277,8 @@ export function Sidebar({
   tab,
   width,
   folders,
+  folderBranches,
+  tabs,
   lanes,
   remotes,
   attentionIds,
@@ -284,6 +295,7 @@ export function Sidebar({
   onSelectLane,
   onAddLane,
   onEditLane,
+  onDuplicateLane,
   onStartLane,
   onStartAll,
   onRunCommand,
@@ -295,6 +307,8 @@ export function Sidebar({
   tab: SidebarTab;
   width: number;
   folders: string[];
+  folderBranches: Record<string, string>;
+  tabs: CanvasTab[];
   lanes: Lane[];
   remotes: Map<number, RemoteTerminal>;
   attentionIds: Set<number>;
@@ -311,6 +325,7 @@ export function Sidebar({
   onSelectLane: (id: number) => void;
   onAddLane: (kind: 'terminal' | 'agent') => void;
   onEditLane: (lane: Lane) => void;
+  onDuplicateLane: (lane: Lane) => void;
   onStartLane: (id: number) => void;
   onStartAll: () => void;
   onRunCommand: (id: number) => void;
@@ -423,6 +438,7 @@ export function Sidebar({
                 <ExplorerRoot
                   key={folder}
                   rootPath={folder}
+                  branch={folderBranches[folder]}
                   homeDir={homeDir}
                   showHidden={showHidden}
                   refreshTick={refreshTick}
@@ -599,12 +615,24 @@ export function Sidebar({
                             }`}
                           />
                           <span className="lane-list-name">{lane.name}</span>
+                          {tabs.length > 1 && (
+                            <span className="lane-tab-tag">
+                              {tabs.find((t) => t.id === lane.tabId)?.name ?? ''}
+                            </span>
+                          )}
                           {needsAttention && <span className="pill accent-soft">Ready</span>}
                           {!needsAttention && remote?.agent && (
                             <span className="pill subtle">{remote.agent}</span>
                           )}
                         </button>
                         <span className="row-actions">
+                          <button
+                            className="icon-btn xs"
+                            title="Duplicate lane"
+                            onClick={() => onDuplicateLane(lane)}
+                          >
+                            <Icon name="copy" size={12} />
+                          </button>
                           <button
                             className="icon-btn xs"
                             title="Edit lane"

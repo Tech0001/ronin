@@ -1,14 +1,28 @@
+export interface CanvasTab {
+  id: string;
+  name: string;
+}
+
 export interface Lane {
   processId: number;
   name: string;
   kind: 'terminal' | 'agent';
   command: string;
   cwd: string;
+  projectDir?: string;
+  tabId: string;
   x: number;
   y: number;
   width: number;
   height: number;
   fontSize?: number;
+}
+
+export interface LaneGitInfo {
+  id: number;
+  branch?: string;
+  repoName?: string;
+  liveCwd?: string;
 }
 
 export interface RemoteTerminal {
@@ -46,6 +60,8 @@ export interface AppSettings {
 
 export interface WorkspaceState {
   folders: string[];
+  tabs: CanvasTab[];
+  activeTabId: string;
   lanes: Lane[];
   columns: number;
   autoFit: boolean;
@@ -141,6 +157,7 @@ export interface FilePreviewResult {
   image?: string;
   startLine?: number;
   totalLines?: number;
+  editable?: boolean;
   note?: string;
   error?: string;
 }
@@ -149,6 +166,7 @@ export interface PreviewRequest {
   requestId: number;
   path: string;
   cwd?: string;
+  fallbackRoots?: string[];
   line?: number;
   column?: number;
   sourceLaneId?: number;

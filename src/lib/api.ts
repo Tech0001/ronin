@@ -6,6 +6,7 @@ import type {
   DaemonStatus,
   DirEntryItem,
   FilePreviewResult,
+  LaneGitInfo,
   QuickFileItem,
   RemoteTerminal,
   SearchResponse,
@@ -54,8 +55,17 @@ export const api = {
     }),
   quickOpen: (roots: string[], query: string) =>
     invoke<QuickFileItem[]>('fs_quick_open', { roots, query }),
-  previewFile: (path: string, cwd?: string, line?: number, column?: number) =>
-    invoke<FilePreviewResult>('fs_preview_file', { path, cwd, line, column }),
+  previewFile: (
+    path: string,
+    cwd?: string,
+    fallbackRoots?: string[],
+    line?: number,
+    column?: number,
+  ) => invoke<FilePreviewResult>('fs_preview_file', { path, cwd, fallbackRoots, line, column }),
+  writeFile: (path: string, content: string) => invoke<void>('fs_write_file', { path, content }),
+  gitBranches: (paths: string[]) => invoke<Record<string, string>>('fs_git_branches', { paths }),
+  laneGitInfo: (lanes: { id: number; cwd: string; projectDir?: string }[]) =>
+    invoke<LaneGitInfo[]>('fs_lane_git_info', { lanes }),
   openExternal: (target: string, cwd?: string) =>
     invoke<void>('fs_open_external', { target, cwd }),
   isDir: (path: string) => invoke<boolean>('fs_is_dir', { path }),

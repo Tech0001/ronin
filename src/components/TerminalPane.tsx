@@ -52,6 +52,7 @@ export function TerminalPane({
   onFocusChange,
   onAttention,
   onChangeFontSize,
+  onDuplicate,
 }: {
   lane: Lane;
   remote?: RemoteTerminal;
@@ -69,6 +70,7 @@ export function TerminalPane({
   onFocusChange: (laneId: number, focused: boolean) => void;
   onAttention: (laneId: number) => void;
   onChangeFontSize: (laneId: number, size: number | undefined) => void;
+  onDuplicate: (lane: Lane) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -245,8 +247,21 @@ export function TerminalPane({
       setSearchResults({ index: e.resultIndex, count: e.resultCount });
     });
 
+    let quietUntil = 0;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    let unfocusedVisibleChars = 0;
+
+    const resetAttentionQuiet = (ms = 2000) => {
+      quietUntil = Math.max(quietUntil, Date.now() + ms);
+      unfocusedVisibleChars = 0;
+      if (settleTimer) {
+        clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+    };
+
     const bellSub = term.onBell(() => {
-      if (attachedRef.current && !focusedRef.current) {
+      if (attachedRef.current && !focusedRef.current && Date.now() >= quietUntil) {
         onAttentionRef.current(lane.processId);
       }
     });
@@ -254,6 +269,8 @@ export function TerminalPane({
     term.attachCustomKeyEventHandler((event) => {
       const action = terminalShortcut(event, /Mac/.test(navigator.platform));
       if (!action) return true;
+      // Let window-level handler process Ctrl+Alt pane navigation & maximize without xterm consuming it.
+      if (action === 'paneNav') return false;
       event.preventDefault();
       event.stopPropagation();
       if (event.type === 'keydown') {
@@ -286,6 +303,8 @@ export function TerminalPane({
       }
     });
     const resizeSub = term.onResize(({ cols, rows }) => {
+      // Resizing causes shells and TUIs to redraw their prompt/status lines; ignore those redraws for Ready badges.
+      resetAttentionQuiet(2000);
       if (liveRef.current) {
         void api.terminalResize(lane.processId, cols, rows).catch(() => {});
       }
@@ -316,8 +335,6 @@ export function TerminalPane({
     let rendering = false;
     let disposed = false;
     let outputTail = '';
-    let settleTimer: ReturnType<typeof setTimeout> | null = null;
-    let unfocusedVisibleChars = 0;
 
     const pump = () => {
       if (rendering || disposed || !queue.length) return;
@@ -342,6 +359,7 @@ export function TerminalPane({
         }
         if (item.type === 'replay') {
           attachedRef.current = true;
+          resetAttentionQuiet(2200);
           fitAddon.fit();
           if (liveRef.current) {
             void api.terminalResize(lane.processId, term.cols, term.rows).catch(() => {});
@@ -363,16 +381,17 @@ export function TerminalPane({
       state.seq = ev.seq;
       enqueueRef.current?.({ type: 'output', data: ev.data });
 
-      // Detect settled live output on unfocused panes so finished agents subtly signal readiness.
-      if (attachedRef.current && !focusedRef.current) {
+      // Detect settled live output on unfocused panes so finished agents subtly signal readiness
+      // without triggering on initial prompts or resize redraws.
+      if (attachedRef.current && !focusedRef.current && Date.now() >= quietUntil) {
         const plain = ev.data.replace(ANSI_STRIP_RE, '').trim();
         if (plain.length > 0) {
           unfocusedVisibleChars += plain.length;
           if (settleTimer) clearTimeout(settleTimer);
-          if (unfocusedVisibleChars >= 12) {
+          if (unfocusedVisibleChars >= 48) {
             settleTimer = setTimeout(() => {
               settleTimer = null;
-              if (!disposed && !focusedRef.current && unfocusedVisibleChars >= 12) {
+              if (!disposed && !focusedRef.current && unfocusedVisibleChars >= 48) {
                 unfocusedVisibleChars = 0;
                 onAttentionRef.current(lane.processId);
               }
@@ -682,6 +701,15 @@ export function TerminalPane({
               }}
             >
               <span>Clear selection</span>
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                setContextMenu(null);
+                onDuplicate(lane);
+              }}
+            >
+              <span>Duplicate lane</span>
             </button>
             <button
               role="menuitem"

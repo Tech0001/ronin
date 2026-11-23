@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AppSettings,
+  CanvasTab,
   DaemonStatus,
   FilePreviewResult,
   Lane,
+  LaneGitInfo,
   PreviewRequest,
   RemoteTerminal,
   SidebarTab,
@@ -16,7 +18,7 @@ import {
   autoFitPanels,
   dropTerminalPanel,
 } from './lib/terminalLayout';
-import { shortenHome } from './lib/terminalFiles';
+import { baseName, shortenHome } from './lib/terminalFiles';
 import { applyThemeToDocument } from './lib/theme';
 import { Icon, RoninMark } from './components/Icon';
 import { OutputHandler, TerminalPane } from './components/TerminalPane';
@@ -49,6 +51,8 @@ const DEFAULT_THEME: ThemePalette = {
 
 const DEFAULT_WORKSPACE: WorkspaceState = {
   folders: [],
+  tabs: [{ id: 'main', name: 'Main' }],
+  activeTabId: 'main',
   lanes: [],
   columns: 0,
   autoFit: true,
@@ -88,6 +92,10 @@ export function App() {
   const [displayVersions, setDisplayVersions] = useState<Record<number, number>>({});
   const [searchTriggers, setSearchTriggers] = useState<Record<number, number>>({});
   const [attentionIds, setAttentionIds] = useState<Set<number>>(() => new Set());
+  const [folderBranches, setFolderBranches] = useState<Record<string, string>>({});
+  const [laneGit, setLaneGit] = useState<Map<number, LaneGitInfo>>(() => new Map());
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
+  const [tabRenameDraft, setTabRenameDraft] = useState('');
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const [toast, setToast] = useState<string | null>(null);
 
@@ -145,8 +153,25 @@ export function App() {
     [persistWorkspace],
   );
 
+  const tabs: CanvasTab[] = workspace.tabs?.length
+    ? workspace.tabs
+    : [{ id: 'main', name: 'Main' }];
+  const activeTabId = tabs.some((t) => t.id === workspace.activeTabId)
+    ? workspace.activeTabId
+    : tabs[0].id;
+
+  const visibleLanes = useMemo(
+    () => workspace.lanes.filter((l) => (l.tabId || 'main') === activeTabId),
+    [workspace.lanes, activeTabId],
+  );
+
   const focusLane = useCallback((id: number | null) => {
-    const target = id ?? workspaceRef.current.lanes[0]?.processId;
+    const ws = workspaceRef.current;
+    const currentTab = ws.tabs?.some((t) => t.id === ws.activeTabId)
+      ? ws.activeTabId
+      : ws.tabs?.[0]?.id ?? 'main';
+    const fallback = ws.lanes.find((l) => (l.tabId || 'main') === currentTab)?.processId;
+    const target = id ?? fallback;
     if (target !== undefined) {
       document
         .querySelector<HTMLTextAreaElement>(`[data-lane-id="${target}"] .xterm-helper-textarea`)
@@ -288,7 +313,53 @@ export function App() {
     return () => observer.disconnect();
   }, [booted]);
 
-  // Auto-fit panels when viewport, columns, or lane count changes
+  // Poll live git branches (.git/HEAD + /proc cwd) every 5s when visible (zero subprocesses)
+  const gitDepsKey = useMemo(
+    () =>
+      JSON.stringify({
+        f: workspace.folders,
+        l: workspace.lanes.map((l) => [l.processId, l.cwd, l.projectDir ?? '']),
+      }),
+    [workspace.folders, workspace.lanes],
+  );
+
+  useEffect(() => {
+    if (!booted) return;
+    let cancelled = false;
+    const refreshGit = async () => {
+      if (document.visibilityState === 'hidden') return;
+      const ws = workspaceRef.current;
+      try {
+        const [branches, info] = await Promise.all([
+          ws.folders.length ? api.gitBranches(ws.folders) : Promise.resolve({}),
+          ws.lanes.length
+            ? api.laneGitInfo(
+                ws.lanes.map((l) => ({
+                  id: l.processId,
+                  cwd: l.cwd,
+                  projectDir: l.projectDir,
+                })),
+              )
+            : Promise.resolve([]),
+        ]);
+        if (cancelled) return;
+        setFolderBranches(branches);
+        const map = new Map<number, LaneGitInfo>();
+        for (const item of info) map.set(item.id, item);
+        setLaneGit(map);
+      } catch {
+        /* ignore transient git poll errors */
+      }
+    };
+    void refreshGit();
+    const timer = setInterval(() => void refreshGit(), 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [booted, gitDepsKey, daemon.connected]);
+
+  // Auto-fit visible tab panels when viewport, columns, tab, or visible lane count changes
   useEffect(() => {
     if (
       !booted ||
@@ -300,24 +371,27 @@ export function App() {
     ) {
       return;
     }
-    const lanes = workspaceRef.current.lanes;
-    if (!lanes.length) return;
-    const next = autoFitPanels(lanes, canvasSize.width, canvasSize.height, workspace.columns);
-    const changed = next.some(
-      (l, i) =>
-        l.x !== lanes[i].x ||
-        l.y !== lanes[i].y ||
-        l.width !== lanes[i].width ||
-        l.height !== lanes[i].height,
-    );
+    const all = workspaceRef.current.lanes;
+    const active = all.filter((l) => (l.tabId || 'main') === activeTabId);
+    if (!active.length) return;
+    const fitted = autoFitPanels(active, canvasSize.width, canvasSize.height, workspace.columns);
+    const byId = new Map(fitted.map((l) => [l.processId, l]));
+    const changed = active.some((l) => {
+      const n = byId.get(l.processId)!;
+      return l.x !== n.x || l.y !== n.y || l.width !== n.width || l.height !== n.height;
+    });
     if (changed) {
-      updateWorkspace((prev) => ({ ...prev, lanes: next }));
+      updateWorkspace((prev) => ({
+        ...prev,
+        lanes: prev.lanes.map((l) => byId.get(l.processId) ?? l),
+      }));
     }
   }, [
     booted,
     workspace.autoFit,
     workspace.columns,
-    workspace.lanes.length,
+    activeTabId,
+    visibleLanes.length,
     canvasSize.width,
     canvasSize.height,
     maximizedId,
@@ -327,8 +401,85 @@ export function App() {
   // Global keyboard shortcuts (carefully avoiding single-Ctrl terminal readline bindings!)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
       const key = e.key.toLowerCase();
+
+      // Ctrl+Alt pane navigation & maximize (works both inside and outside terminals)
+      if (e.ctrlKey && e.altKey && !e.metaKey && !e.shiftKey) {
+        const ws = workspaceRef.current;
+        const curTab = ws.tabs?.some((t) => t.id === ws.activeTabId)
+          ? ws.activeTabId
+          : ws.tabs?.[0]?.id ?? 'main';
+        const onTab = ws.lanes.filter((l) => (l.tabId || 'main') === curTab);
+        if (!onTab.length) return;
+
+        if (key === 'm') {
+          e.preventDefault();
+          const targetId = activeLaneRef.current ?? onTab[0].processId;
+          setMaximizedId((m) => (m === targetId ? null : targetId));
+          requestAnimationFrame(() => focusLane(targetId));
+          return;
+        }
+        if (/^[1-9]$/.test(key)) {
+          const target = onTab[Number(key) - 1];
+          if (target) {
+            e.preventDefault();
+            setMaximizedId(null);
+            activeLaneRef.current = target.processId;
+            requestAnimationFrame(() => {
+              document
+                .querySelector(`[data-lane-id="${target.processId}"]`)
+                ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+              focusLane(target.processId);
+            });
+          }
+          return;
+        }
+        if (
+          key === 'arrowleft' ||
+          key === 'arrowright' ||
+          key === 'arrowup' ||
+          key === 'arrowdown'
+        ) {
+          e.preventDefault();
+          const cur = onTab.find((l) => l.processId === activeLaneRef.current) ?? onTab[0];
+          const cx = cur.x + cur.width / 2;
+          const cy = cur.y + cur.height / 2;
+          let best: Lane | null = null;
+          let bestScore = Infinity;
+          for (const cand of onTab) {
+            if (cand.processId === cur.processId) continue;
+            const dx = cand.x + cand.width / 2 - cx;
+            const dy = cand.y + cand.height / 2 - cy;
+            const inDir =
+              (key === 'arrowright' && dx > 12) ||
+              (key === 'arrowleft' && dx < -12) ||
+              (key === 'arrowdown' && dy > 12) ||
+              (key === 'arrowup' && dy < -12);
+            if (!inDir) continue;
+            const primary = key === 'arrowleft' || key === 'arrowright' ? Math.abs(dx) : Math.abs(dy);
+            const secondary = key === 'arrowleft' || key === 'arrowright' ? Math.abs(dy) : Math.abs(dx);
+            const score = primary + secondary * 2.4;
+            if (score < bestScore) {
+              bestScore = score;
+              best = cand;
+            }
+          }
+          if (best) {
+            setMaximizedId(null);
+            activeLaneRef.current = best.processId;
+            const nextId = best.processId;
+            requestAnimationFrame(() => {
+              document
+                .querySelector(`[data-lane-id="${nextId}"]`)
+                ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+              focusLane(nextId);
+            });
+          }
+          return;
+        }
+      }
+
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
       const inTerminal = terminalFocusedRef.current;
 
       if (key === 'p' && (e.shiftKey || !inTerminal)) {
@@ -354,15 +505,31 @@ export function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [updateWorkspace]);
+  }, [updateWorkspace, focusLane]);
 
   const openFilePreview = useCallback(
-    (path: string, cwd?: string, line?: number, column?: number, sourceLaneId?: number) => {
+    (
+      path: string,
+      cwd?: string,
+      line?: number,
+      column?: number,
+      sourceLaneId?: number,
+      fallbackRoots?: string[],
+    ) => {
       const requestId = ++nextPreviewRequestId;
-      const request: PreviewRequest = { requestId, path, cwd, line, column, sourceLaneId };
+      const roots = fallbackRoots ?? workspaceRef.current.folders;
+      const request: PreviewRequest = {
+        requestId,
+        path,
+        cwd,
+        fallbackRoots: roots,
+        line,
+        column,
+        sourceLaneId,
+      };
       setPreview({ request });
       void api
-        .previewFile(path, cwd, line, column)
+        .previewFile(path, cwd, roots, line, column)
         .then((result) => {
           setPreview((curr) =>
             curr && curr.request.requestId === requestId ? { ...curr, data: result } : curr,
@@ -385,13 +552,20 @@ export function App() {
   const handleOpenLink = useCallback(
     (target: string, laneId: number, mode: 'preview' | 'external') => {
       const lane = workspaceRef.current.lanes.find((l) => l.processId === laneId);
+      const liveCwd = laneGit.get(laneId)?.liveCwd;
+      const baseCwd = liveCwd || lane?.cwd;
+      const fallbacks = [
+        ...(lane?.projectDir ? [lane.projectDir] : []),
+        ...(lane?.cwd && lane.cwd !== baseCwd ? [lane.cwd] : []),
+        ...workspaceRef.current.folders,
+      ];
       if (/^https?:\/\//i.test(target) || mode === 'external') {
-        void api.openExternal(target, lane?.cwd).catch((err) => showToast(String(err)));
+        void api.openExternal(target, baseCwd).catch((err) => showToast(String(err)));
       } else {
-        openFilePreview(target, lane?.cwd, undefined, undefined, laneId);
+        openFilePreview(target, baseCwd, undefined, undefined, laneId, fallbacks);
       }
     },
-    [openFilePreview, showToast],
+    [openFilePreview, showToast, laneGit],
   );
 
   const handleAddFolder = async () => {
@@ -532,23 +706,31 @@ export function App() {
     kind: 'terminal' | 'agent';
     command: string;
     cwd: string;
+    projectDir?: string;
+    tabId: string;
   }) => {
     const existing = workspaceRef.current.lanes;
+    const onTab = existing.filter((l) => (l.tabId || 'main') === data.tabId);
     const processId = Math.max(0, ...existing.map((l) => l.processId)) + 1;
-    const bottom = Math.max(10, ...existing.map((l) => l.y + l.height));
+    const bottom = Math.max(10, ...onTab.map((l) => l.y + l.height));
     const created: Lane = {
       processId,
       name: data.name,
       kind: data.kind,
       command: data.command,
       cwd: data.cwd,
+      projectDir: data.projectDir,
+      tabId: data.tabId,
       x: 10,
       y: bottom + 8,
       width: 560,
       height: 380,
     };
     const nextLanes = [...existing, created];
-    updateWorkspace((prev) => ({ ...prev, lanes: nextLanes }), true);
+    updateWorkspace(
+      (prev) => ({ ...prev, activeTabId: data.tabId, lanes: nextLanes }),
+      true,
+    );
     setMaximizedId(null);
     await api.terminalStart(processId, data.cwd);
     const list = await api.daemonList().catch(() => []);
@@ -560,22 +742,109 @@ export function App() {
     requestAnimationFrame(() => focusLane(processId));
   };
 
+  const handleDuplicateLane = useCallback(
+    async (lane: Lane) => {
+      try {
+        await handleCreateLane({
+          name: `${lane.name} (2)`,
+          kind: lane.kind,
+          command: lane.command,
+          cwd: lane.cwd,
+          projectDir: lane.projectDir,
+          tabId: lane.tabId || activeTabId,
+        });
+      } catch (err) {
+        showToast(String(err));
+      }
+    },
+    [activeTabId, showToast],
+  );
+
   const handleEditLane = async (
     id: number,
-    data: { name: string; kind: 'terminal' | 'agent'; command: string; cwd: string },
+    data: {
+      name: string;
+      kind: 'terminal' | 'agent';
+      command: string;
+      cwd: string;
+      projectDir?: string;
+      tabId: string;
+    },
   ) => {
     updateWorkspace(
       (prev) => ({
         ...prev,
+        activeTabId: data.tabId,
         lanes: prev.lanes.map((l) =>
           l.processId === id
-            ? { ...l, name: data.name, kind: data.kind, command: data.command, cwd: data.cwd }
+            ? {
+                ...l,
+                name: data.name,
+                kind: data.kind,
+                command: data.command,
+                cwd: data.cwd,
+                projectDir: data.projectDir,
+                tabId: data.tabId,
+              }
             : l,
         ),
       }),
       true,
     );
     requestAnimationFrame(() => focusLane(id));
+  };
+
+  const handleAddTab = () => {
+    const id = `tab-${Date.now().toString(36)}`;
+    const name = `Canvas ${tabs.length + 1}`;
+    setMaximizedId(null);
+    updateWorkspace(
+      (prev) => ({
+        ...prev,
+        tabs: [...(prev.tabs?.length ? prev.tabs : [{ id: 'main', name: 'Main' }]), { id, name }],
+        activeTabId: id,
+      }),
+      true,
+    );
+    setRenamingTabId(id);
+    setTabRenameDraft(name);
+  };
+
+  const handleRenameTab = (id: string, nextName: string) => {
+    const clean = nextName.trim();
+    setRenamingTabId(null);
+    if (!clean) return;
+    updateWorkspace(
+      (prev) => ({
+        ...prev,
+        tabs: (prev.tabs?.length ? prev.tabs : [{ id: 'main', name: 'Main' }]).map((t) =>
+          t.id === id ? { ...t, name: clean } : t,
+        ),
+      }),
+      true,
+    );
+  };
+
+  const handleRemoveTab = (id: string) => {
+    if (tabs.length <= 1) return;
+    const remaining = tabs.filter((t) => t.id !== id);
+    const fallbackId = remaining[0].id;
+    const movedCount = workspaceRef.current.lanes.filter((l) => (l.tabId || 'main') === id).length;
+    setMaximizedId(null);
+    updateWorkspace(
+      (prev) => ({
+        ...prev,
+        tabs: remaining,
+        activeTabId: prev.activeTabId === id ? fallbackId : prev.activeTabId,
+        lanes: prev.lanes.map((l) =>
+          (l.tabId || 'main') === id ? { ...l, tabId: fallbackId } : l,
+        ),
+      }),
+      true,
+    );
+    if (movedCount > 0) {
+      showToast(`Moved ${movedCount} lane${movedCount === 1 ? '' : 's'} to ${remaining[0].name}.`);
+    }
   };
 
   const handleRemoveLane = (lane: Lane) => {
@@ -645,7 +914,13 @@ export function App() {
     event.preventDefault();
     dragCleanupRef.current?.();
 
-    const original = workspaceRef.current.lanes.map((l) => ({ ...l }));
+    const laneTab = lane.tabId || 'main';
+    const otherTabs = workspaceRef.current.lanes
+      .filter((l) => (l.tabId || 'main') !== laneTab)
+      .map((l) => ({ ...l }));
+    const original = workspaceRef.current.lanes
+      .filter((l) => (l.tabId || 'main') === laneTab)
+      .map((l) => ({ ...l }));
     if (resize && workspaceRef.current.autoFit) {
       updateWorkspace((prev) => ({ ...prev, autoFit: false }));
     }
@@ -691,17 +966,20 @@ export function App() {
           }
         }
       }
-      const next = original.map((l) => (l.processId === lane.processId ? changed : l));
-      workspaceRef.current = { ...workspaceRef.current, lanes: next };
+      const nextOnTab = original.map((l) => (l.processId === lane.processId ? changed : l));
+      workspaceRef.current = { ...workspaceRef.current, lanes: [...otherTabs, ...nextOnTab] };
       setWorkspace(workspaceRef.current);
     };
 
     const finish = (e?: Event) => {
-      const current = workspaceRef.current.lanes.find((l) => l.processId === lane.processId)!;
+      const currentTabLanes = workspaceRef.current.lanes.filter(
+        (l) => (l.tabId || 'main') === laneTab,
+      );
+      const current = currentTabLanes.find((l) => l.processId === lane.processId)!;
       let result =
         e?.type === 'pointerup'
           ? resize
-            ? workspaceRef.current.lanes
+            ? currentTabLanes
             : dropTerminalPanel(original, current)
           : original;
       if (workspaceRef.current.autoFit && !resize && canvasSize.width && canvasSize.height) {
@@ -712,7 +990,7 @@ export function App() {
           workspaceRef.current.columns,
         );
       }
-      updateWorkspace((prev) => ({ ...prev, lanes: result }), true);
+      updateWorkspace((prev) => ({ ...prev, lanes: [...otherTabs, ...result] }), true);
       if (e?.type === 'pointerup') focusLane(lane.processId);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', finish);
@@ -730,23 +1008,41 @@ export function App() {
 
   const arrangePanels = () => {
     setMaximizedId(null);
+    const active = workspaceRef.current.lanes.filter((l) => (l.tabId || 'main') === activeTabId);
     const arranged = arrangeTerminalPanels(
-      workspaceRef.current.lanes,
+      active,
       viewportRef.current?.clientWidth ?? 1200,
       workspaceRef.current.columns,
     );
-    updateWorkspace((prev) => ({ ...prev, autoFit: false, lanes: arranged }), true);
+    const byId = new Map(arranged.map((l) => [l.processId, l]));
+    updateWorkspace(
+      (prev) => ({
+        ...prev,
+        autoFit: false,
+        lanes: prev.lanes.map((l) => byId.get(l.processId) ?? l),
+      }),
+      true,
+    );
   };
 
   const resetSizes = () => {
     setMaximizedId(null);
+    const active = workspaceRef.current.lanes.filter((l) => (l.tabId || 'main') === activeTabId);
     const fitted = autoFitPanels(
-      workspaceRef.current.lanes,
+      active,
       canvasSize.width,
       canvasSize.height,
       workspaceRef.current.columns,
     );
-    updateWorkspace((prev) => ({ ...prev, autoFit: true, lanes: fitted }), true);
+    const byId = new Map(fitted.map((l) => [l.processId, l]));
+    updateWorkspace(
+      (prev) => ({
+        ...prev,
+        autoFit: true,
+        lanes: prev.lanes.map((l) => byId.get(l.processId) ?? l),
+      }),
+      true,
+    );
   };
 
   const toggleRailTab = (tab: SidebarTab) => {
@@ -777,10 +1073,10 @@ export function App() {
 
   const canvasDimensions = useMemo(() => {
     if (maximizedId !== null) return { width: '100%', height: '100%' };
-    const maxW = Math.max(0, ...workspace.lanes.map((l) => l.x + l.width + 10));
-    const maxH = Math.max(0, ...workspace.lanes.map((l) => l.y + l.height + 10));
+    const maxW = Math.max(0, ...visibleLanes.map((l) => l.x + l.width + 10));
+    const maxH = Math.max(0, ...visibleLanes.map((l) => l.y + l.height + 10));
     return { width: maxW, height: maxH };
-  }, [workspace.lanes, maximizedId]);
+  }, [visibleLanes, maximizedId]);
 
   const defaultLaneCwd = workspace.folders[0] || homeDir;
 
@@ -858,6 +1154,8 @@ export function App() {
           tab={workspace.sidebarTab}
           width={workspace.sidebarWidth}
           folders={workspace.folders}
+          folderBranches={folderBranches}
+          tabs={tabs}
           lanes={workspace.lanes}
           remotes={remotes}
           attentionIds={attentionIds}
@@ -887,6 +1185,11 @@ export function App() {
           onSelectLane={(id) => {
             clearAttention(id);
             setMaximizedId(null);
+            const target = workspaceRef.current.lanes.find((l) => l.processId === id);
+            const targetTab = target?.tabId || 'main';
+            if (targetTab !== activeTabId) {
+              updateWorkspace((prev) => ({ ...prev, activeTabId: targetTab }), true);
+            }
             requestAnimationFrame(() => {
               document
                 .querySelector(`[data-lane-id="${id}"]`)
@@ -896,6 +1199,7 @@ export function App() {
           }}
           onAddLane={(kind) => setLaneModal({ mode: 'create', kind })}
           onEditLane={(lane) => setLaneModal({ mode: 'edit', lane })}
+          onDuplicateLane={(lane) => void handleDuplicateLane(lane)}
           onStartLane={(id) => void handleStartLane(id)}
           onStartAll={() => void handleStartAll(false)}
           onRunCommand={(id) => void handleRunCommand(id)}
@@ -960,6 +1264,74 @@ export function App() {
                 <span>Run all</span>
               </button>
             )}
+
+            <div className="tab-strip" role="tablist" aria-label="Canvas pages">
+              {tabs.map((t) => {
+                const isActive = t.id === activeTabId;
+                const hasBgAttention =
+                  !isActive &&
+                  workspace.lanes.some(
+                    (l) => (l.tabId || 'main') === t.id && attentionIds.has(l.processId),
+                  );
+                if (renamingTabId === t.id) {
+                  return (
+                    <input
+                      key={t.id}
+                      className="canvas-tab-input"
+                      autoFocus
+                      value={tabRenameDraft}
+                      onChange={(e) => setTabRenameDraft(e.target.value)}
+                      onBlur={() => handleRenameTab(t.id, tabRenameDraft)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleRenameTab(t.id, tabRenameDraft);
+                        if (e.key === 'Escape') setRenamingTabId(null);
+                      }}
+                    />
+                  );
+                }
+                return (
+                  <button
+                    key={t.id}
+                    role="tab"
+                    aria-selected={isActive}
+                    className={`canvas-tab${isActive ? ' active' : ''}`}
+                    title="Click to switch · Double-click to rename"
+                    onClick={() => {
+                      setMaximizedId(null);
+                      updateWorkspace((prev) => ({ ...prev, activeTabId: t.id }), true);
+                    }}
+                    onDoubleClick={() => {
+                      setRenamingTabId(t.id);
+                      setTabRenameDraft(t.name);
+                    }}
+                  >
+                    {hasBgAttention && <span className="dot attention" />}
+                    <span>{t.name}</span>
+                    {tabs.length > 1 && (
+                      <span
+                        className="canvas-tab-close"
+                        role="button"
+                        title={`Remove ${t.name} tab (lanes move to first tab)`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleRemoveTab(t.id);
+                        }}
+                      >
+                        <Icon name="close" size={10} />
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+              <button
+                className="tab-add-btn"
+                title="Add canvas tab"
+                aria-label="Add canvas tab"
+                onClick={handleAddTab}
+              >
+                <Icon name="plus" size={12} />
+              </button>
+            </div>
 
             <button
               className="quick-open-pill"
@@ -1061,15 +1433,20 @@ export function App() {
 
         <div className="canvas-viewport" ref={viewportRef}>
           <div className="canvas-stage" style={canvasDimensions}>
-            {booted && !workspace.lanes.length && (
+            {booted && !visibleLanes.length && (
               <div className="empty-state">
                 <div className="empty-emblem">
                   <RoninMark size={40} />
                 </div>
-                <h1>Your terminals, without the IDE weight.</h1>
+                <h1>
+                  {workspace.lanes.length
+                    ? `No panels on ${tabs.find((t) => t.id === activeTabId)?.name ?? 'this tab'} yet.`
+                    : 'Your terminals, without the IDE weight.'}
+                </h1>
                 <p>
-                  Add terminal or agent panels above. Drag headers to reorder, resize from any
-                  bottom-right corner, and load repos in the sidebar to browse or search files.
+                  Add terminal or agent panels above. Drag headers to reorder, use{' '}
+                  <kbd>Ctrl+Alt+Arrows</kbd> or <kbd>Ctrl+Alt+1–9</kbd> to jump panes, and{' '}
+                  <kbd>Ctrl+Alt+M</kbd> to maximize.
                 </p>
                 <p className="empty-sub">
                   Every shell runs in Ronin’s detached Rust daemon — closing or reloading this
@@ -1095,12 +1472,18 @@ export function App() {
               </div>
             )}
 
-            {workspace.lanes.map((lane) => {
+            {visibleLanes.map((lane) => {
               const remote = remotes.get(lane.processId);
               const isRunning = Boolean(remote?.running);
               const isMax = maximizedId === lane.processId;
               const needsAttention = attentionIds.has(lane.processId);
               const effectiveFontSize = lane.fontSize ?? workspace.settings.fontSize;
+              const git = laneGit.get(lane.processId);
+              const branchLabel = git?.branch
+                ? git.repoName && git.repoName !== baseName(lane.cwd)
+                  ? `${git.repoName} · ${git.branch}`
+                  : git.branch
+                : null;
               return (
                 <article
                   key={lane.processId}
@@ -1233,6 +1616,7 @@ export function App() {
                     }}
                     onAttention={markAttention}
                     onChangeFontSize={handleLaneFontSize}
+                    onDuplicate={(l) => void handleDuplicateLane(l)}
                   />
 
                   <footer className="lane-footer">
@@ -1254,9 +1638,22 @@ export function App() {
                         Run command
                       </button>
                     )}
-                    <span className="lane-cwd" title={lane.cwd}>
-                      {shortenHome(lane.cwd, homeDir)}
+                    <span className="lane-cwd" title={git?.liveCwd || lane.cwd}>
+                      {shortenHome(git?.liveCwd || lane.cwd, homeDir)}
                     </span>
+                    {branchLabel && (
+                      <span
+                        className="git-branch-pill"
+                        title={
+                          lane.projectDir
+                            ? `Linked project repo: ${lane.projectDir} (${git?.branch})`
+                            : `Git branch: ${git?.branch}`
+                        }
+                      >
+                        <Icon name="branch" size={10} />
+                        {branchLabel}
+                      </span>
+                    )}
                   </footer>
 
                   {!isMax && (
@@ -1291,6 +1688,14 @@ export function App() {
           onOpenRelated={(path, cwd) =>
             openFilePreview(path, cwd, undefined, undefined, preview.request.sourceLaneId)
           }
+          onSaved={(savedPath, nextContent) => {
+            setPreview((curr) =>
+              curr && curr.data?.path === savedPath
+                ? { ...curr, data: { ...curr.data, content: nextContent } }
+                : curr,
+            );
+            showToast(`Saved ${baseName(savedPath)}`);
+          }}
         />
       )}
 
@@ -1317,6 +1722,10 @@ export function App() {
               ? laneModal.cwd ?? defaultLaneCwd
               : laneModal.lane.cwd
           }
+          initialTabId={
+            laneModal.mode === 'create' ? activeTabId : laneModal.lane.tabId || activeTabId
+          }
+          tabs={tabs}
           lane={laneModal.mode === 'edit' ? laneModal.lane : undefined}
           folders={workspace.folders}
           homeDir={homeDir}

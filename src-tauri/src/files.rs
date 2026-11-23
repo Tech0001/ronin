@@ -72,10 +72,124 @@ pub struct FilePreviewResult {
     pub start_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_lines: Option<usize>,
+    #[serde(default)]
+    pub editable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneGitInfo {
+    pub id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cwd: Option<String>,
+}
+
+/// Read the active git branch by reading `.git/HEAD` directly (handles worktrees and submodules;
+/// zero `git` subprocess overhead).
+pub fn read_git_branch(path: &str) -> Option<(String, String)> {
+    let mut dir = PathBuf::from(path);
+    if dir.is_file() {
+        dir = dir.parent()?.to_path_buf();
+    }
+    loop {
+        let dot_git = dir.join(".git");
+        if dot_git.exists() {
+            let git_dir = if dot_git.is_dir() {
+                dot_git
+            } else {
+                let text = fs::read_to_string(&dot_git).ok()?;
+                let raw = text.trim().strip_prefix("gitdir:")?.trim();
+                let candidate = PathBuf::from(raw);
+                if candidate.is_absolute() {
+                    candidate
+                } else {
+                    dir.join(candidate)
+                }
+            };
+            let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+            let trimmed = head.trim();
+            let branch = if let Some(rest) = trimmed.strip_prefix("ref: refs/heads/") {
+                rest.to_string()
+            } else if let Some(rest) = trimmed.strip_prefix("ref: ") {
+                rest.rsplit('/').next().unwrap_or(rest).to_string()
+            } else if trimmed.len() >= 7 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                trimmed[..7].to_string()
+            } else {
+                return None;
+            };
+            let repo_name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            return Some((branch, repo_name));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Read the live working directory of a shell (or its foreground process group) from `/proc`.
+pub fn live_process_cwd(shell_pid: u32) -> Option<String> {
+    if shell_pid == 0 {
+        return None;
+    }
+    // Check foreground process group first in case a foreground tool changed directory.
+    if let Ok(stat_text) = fs::read_to_string(format!("/proc/{shell_pid}/stat")) {
+        if let Some(rparen) = stat_text.rfind(')') {
+            if let Some(after) = stat_text.get(rparen + 2..) {
+                let fields: Vec<&str> = after.split_whitespace().collect();
+                if let Some(tpgid) = fields.get(5).and_then(|f| f.parse::<u32>().ok()) {
+                    if tpgid > 0 && tpgid != shell_pid {
+                        if let Ok(link) = fs::read_link(format!("/proc/{tpgid}/cwd")) {
+                            return Some(link.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fs::read_link(format!("/proc/{shell_pid}/cwd"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Atomically save edited text content to an existing text file.
+pub fn write_text_file(path: &str, content: &str) -> Result<(), String> {
+    let target = Path::new(path);
+    if !target.is_absolute() {
+        return Err("File path must be absolute.".into());
+    }
+    if target.is_dir() {
+        return Err("Cannot overwrite a directory.".into());
+    }
+    if content.len() > 2_500_000 {
+        return Err("File exceeds 2.5 MB quick-edit limit.".into());
+    }
+    let parent = target.parent().ok_or("Invalid file path.")?;
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let tmp = parent.join(format!(".{file_name}.ronin-tmp.{}", std::process::id()));
+    let existing_perms = fs::metadata(target).ok().map(|m| m.permissions());
+    fs::write(&tmp, content.as_bytes()).map_err(|e| format!("Failed writing file: {e}"))?;
+    if let Some(perms) = existing_perms {
+        let _ = fs::set_permissions(&tmp, perms);
+    }
+    if let Err(err) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Failed saving file: {err}"));
+    }
+    Ok(())
 }
 
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "__pycache__"];
@@ -510,10 +624,27 @@ fn image_mime(ext: &str) -> Option<&'static str> {
 pub fn read_file_preview(
     raw_path: &str,
     cwd: Option<&str>,
+    fallback_roots: &[String],
     explicit_line: Option<usize>,
     explicit_col: Option<usize>,
 ) -> FilePreviewResult {
-    let (resolved, parsed_line, parsed_col) = resolve_file_target(raw_path, cwd);
+    let (mut resolved, parsed_line, parsed_col) = resolve_file_target(raw_path, cwd);
+    // If an agent launched from a separate agent folder prints a relative path from
+    // a project repo, fall back cleanly to the linked project folder and loaded roots.
+    if !resolved.exists() {
+        let (bare, _, _) = resolve_file_target(raw_path, None);
+        if !bare.is_absolute() {
+            let trimmed = bare.to_string_lossy();
+            let rel = trimmed.trim_start_matches("./");
+            for root in fallback_roots {
+                let candidate = Path::new(root).join(rel);
+                if candidate.exists() {
+                    resolved = candidate;
+                    break;
+                }
+            }
+        }
+    }
     let line = explicit_line.or(parsed_line);
     let column = explicit_col.or(parsed_col);
     let display_path = resolved.to_string_lossy().into_owned();
@@ -534,6 +665,7 @@ pub fn read_file_preview(
                 image: None,
                 start_line: None,
                 total_lines: None,
+                editable: false,
                 note: None,
                 error: Some(format!("Cannot open file: {e}")),
             }
@@ -551,6 +683,7 @@ pub fn read_file_preview(
             image: None,
             start_line: None,
             total_lines: None,
+            editable: false,
             note: None,
             error: Some("This link points to a folder.".into()),
         };
@@ -569,6 +702,7 @@ pub fn read_file_preview(
                 image: None,
                 start_line: None,
                 total_lines: None,
+                editable: false,
                 note: Some("This image is larger than 12 MB. Open it externally to inspect it.".into()),
                 error: None,
             };
@@ -586,6 +720,7 @@ pub fn read_file_preview(
                     image: Some(format!("data:{mime};base64,{encoded}")),
                     start_line: None,
                     total_lines: None,
+                    editable: false,
                     note: None,
                     error: None,
                 }
@@ -600,6 +735,7 @@ pub fn read_file_preview(
                 image: None,
                 start_line: None,
                 total_lines: None,
+                editable: false,
                 note: None,
                 error: Some(format!("Failed reading image: {e}")),
             },
@@ -618,6 +754,7 @@ pub fn read_file_preview(
             image: None,
             start_line: None,
             total_lines: None,
+            editable: false,
             note: Some("This file is larger than 2.5 MB. Open it externally to view the full file.".into()),
             error: None,
         };
@@ -636,6 +773,7 @@ pub fn read_file_preview(
                 image: None,
                 start_line: None,
                 total_lines: None,
+                editable: false,
                 note: None,
                 error: Some(format!("Failed reading file: {e}")),
             }
@@ -653,6 +791,7 @@ pub fn read_file_preview(
             image: None,
             start_line: None,
             total_lines: None,
+            editable: false,
             note: Some("Binary file — preview unavailable. Use Open externally to inspect it.".into()),
             error: None,
         };
@@ -669,8 +808,7 @@ pub fn read_file_preview(
     let total_lines = all_lines.len().max(1);
     let clamped_line = line.map(|l| l.min(total_lines).max(1));
 
-    // For HTML/Markdown under 300KB, send the full content so rendered previews work completely.
-    let (start_idx, end_idx, truncated) = if (kind == "html" || kind == "markdown") && full_text.len() <= 300_000 {
+    let (start_idx, end_idx, truncated) = if full_text.len() <= 300_000 && all_lines.len() <= 2500 {
         (0, all_lines.len(), false)
     } else {
         let start = clamped_line.map(|l| l.saturating_sub(120)).unwrap_or(0);
@@ -678,7 +816,9 @@ pub fn read_file_preview(
         (start, end, start > 0 || end < all_lines.len())
     };
 
-    let mut excerpt = if all_lines.is_empty() {
+    let mut excerpt = if !truncated {
+        full_text.into_owned()
+    } else if all_lines.is_empty() {
         String::new()
     } else {
         all_lines[start_idx..end_idx].join("\n")
@@ -693,7 +833,8 @@ pub fn read_file_preview(
         char_truncated = true;
     }
 
-    let note = if truncated || char_truncated {
+    let is_truncated = truncated || char_truncated;
+    let note = if is_truncated {
         Some(format!(
             "Showing lines {}–{} of {}. Open externally for the full file.",
             start_idx + 1,
@@ -714,6 +855,7 @@ pub fn read_file_preview(
         image: None,
         start_line: Some(start_idx + 1),
         total_lines: Some(total_lines),
+        editable: !is_truncated,
         note,
         error: None,
     }
@@ -809,5 +951,32 @@ mod tests {
         let exact = fuzzy_score("main.rs", "src-tauri/src/main.rs").unwrap();
         let sub = fuzzy_score("main.rs", "src/components/MainPanel.tsx").unwrap_or(-9999);
         assert!(exact > sub);
+    }
+
+    #[test]
+    fn reads_git_branch_from_dir_and_worktree_file() {
+        let base = std::env::temp_dir().join(format!("ronin-git-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let repo = base.join("my-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/clean\n").unwrap();
+        let nested = repo.join("src/nested");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            read_git_branch(&nested.to_string_lossy()),
+            Some(("feat/clean".into(), "my-repo".into()))
+        );
+
+        let wt = base.join("my-wt");
+        let real_git = base.join("wt-gitdir");
+        fs::create_dir_all(&wt).unwrap();
+        fs::create_dir_all(&real_git).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", real_git.display())).unwrap();
+        fs::write(real_git.join("HEAD"), "abcdef1234567890\n").unwrap();
+        assert_eq!(
+            read_git_branch(&wt.to_string_lossy()),
+            Some(("abcdef1".into(), "my-wt".into()))
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 }

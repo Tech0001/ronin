@@ -5,9 +5,9 @@ pub mod theme;
 
 use crate::daemon_client::DaemonClient;
 use crate::files::{
-    clipboard_read, clipboard_write, list_directory, open_external, quick_open_files,
-    read_file_preview, search_workspace, DirEntryItem, FilePreviewResult, QuickFileItem,
-    SearchResponse,
+    clipboard_read, clipboard_write, list_directory, live_process_cwd, open_external,
+    quick_open_files, read_file_preview, read_git_branch, search_workspace, write_text_file,
+    DirEntryItem, FilePreviewResult, LaneGitInfo, QuickFileItem, SearchResponse,
 };
 use crate::state::{load_state, save_state, WindowGeometry, WorkspaceState};
 use crate::theme::{load_theme, watch_omarchy_theme, ThemePalette};
@@ -261,12 +261,87 @@ async fn fs_quick_open(roots: Vec<String>, query: String) -> Result<Vec<QuickFil
 async fn fs_preview_file(
     path: String,
     cwd: Option<String>,
+    fallback_roots: Option<Vec<String>>,
     line: Option<usize>,
     column: Option<usize>,
 ) -> Result<FilePreviewResult, String> {
-    tokio::task::spawn_blocking(move || read_file_preview(&path, cwd.as_deref(), line, column))
+    let roots = fallback_roots.unwrap_or_default();
+    tokio::task::spawn_blocking(move || {
+        read_file_preview(&path, cwd.as_deref(), &roots, line, column)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))
+}
+
+#[tauri::command]
+async fn fs_write_file(path: String, content: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || write_text_file(&path, &content))
         .await
-        .map_err(|e| format!("Task join error: {e}"))
+        .map_err(|e| format!("Task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn fs_git_branches(paths: Vec<String>) -> Result<HashMap<String, String>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut out = HashMap::new();
+        for p in paths {
+            if let Some((branch, _)) = read_git_branch(&p) {
+                out.insert(p, branch);
+            }
+        }
+        out
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LaneGitQuery {
+    id: u32,
+    cwd: String,
+    project_dir: Option<String>,
+}
+
+#[tauri::command]
+async fn fs_lane_git_info(
+    lanes: Vec<LaneGitQuery>,
+    state: State<'_, AppState>,
+) -> Result<Vec<LaneGitInfo>, String> {
+    let queries: Vec<(u32, String, Option<String>, Option<u32>)> = lanes
+        .into_iter()
+        .map(|l| {
+            let pid = state.daemon.known_pid(l.id);
+            (l.id, l.cwd, l.project_dir, pid)
+        })
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        queries
+            .into_iter()
+            .map(|(id, cwd, project_dir, pid)| {
+                let live_cwd = pid.and_then(live_process_cwd);
+                // Prefer linked project_dir if set, else live shell cwd, else configured cwd.
+                let git = project_dir
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .and_then(read_git_branch)
+                    .or_else(|| live_cwd.as_deref().and_then(read_git_branch))
+                    .or_else(|| read_git_branch(&cwd));
+                let (branch, repo_name) = match git {
+                    Some((b, r)) => (Some(b), Some(r)),
+                    None => (None, None),
+                };
+                LaneGitInfo {
+                    id,
+                    branch,
+                    repo_name,
+                    live_cwd,
+                }
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))
 }
 
 #[tauri::command]
@@ -382,6 +457,9 @@ pub fn run() {
             fs_search,
             fs_quick_open,
             fs_preview_file,
+            fs_write_file,
+            fs_git_branches,
+            fs_lane_git_info,
             fs_open_external,
             fs_is_dir,
             sys_clipboard_read,
