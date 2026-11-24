@@ -3,7 +3,7 @@ members = [".", "daemon"]
 
 [package]
 name = "ronin"
-version = "1.1.0"
+version = "1.1.1"
 description = "Lightweight Rust + Tauri desktop workspace for persistent terminal and AI agent panels"
 repository = "https://github.com/Tech0001/ronin"
 license = "MIT"

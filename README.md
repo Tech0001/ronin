@@ -64,12 +64,12 @@ Download from [GitHub Releases](https://github.com/Tech0001/ronin/releases):
 
 - **Linux (Arch / Omarchy):**
   ```bash
-  sudo pacman -U ronin-1.1.0-1-x86_64.pkg.tar.zst
+  sudo pacman -U ronin-1.1.1-1-x86_64.pkg.tar.zst
   ```
 - **Linux (Debian / Ubuntu):** install the `.deb` package, or use the portable tarball:
   ```bash
-  tar -xzf ronin-1.1.0-linux-x86_64.tar.gz
-  cd ronin-1.1.0-linux-x86_64
+  tar -xzf ronin-1.1.1-linux-x86_64.tar.gz
+  cd ronin-1.1.1-linux-x86_64
   ./install.sh
   ```
 - **macOS (Apple Silicon & Intel):** open the `.dmg` and drag **Ronin** to Applications.

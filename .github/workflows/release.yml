@@ -128,7 +128,7 @@ jobs:
       - name: Build Linux tarball and .deb
         if: matrix.platform == 'linux'
         run: |
-          npx tauri build --target ${{ matrix.target }} --bundles deb --config '{"bundle":{"externalBin":["binaries/ronin-daemon"]}}'
+          npx tauri build --ci --target ${{ matrix.target }} --bundles deb --features custom-protocol --config src-tauri/tauri.release.conf.json
           mkdir -p upload
           cp src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb upload/
           # Also assemble portable .tar.gz
@@ -141,14 +141,14 @@ jobs:
       - name: Build macOS .dmg
         if: matrix.platform == 'macos'
         run: |
-          npx tauri build --target ${{ matrix.target }} --bundles dmg --config '{"bundle":{"externalBin":["binaries/ronin-daemon"]}}'
+          npx tauri build --ci --target ${{ matrix.target }} --bundles dmg --features custom-protocol --config src-tauri/tauri.release.conf.json
           mkdir -p upload
           cp src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg upload/
 
       - name: Build Windows installers (.exe & .msi)
         if: matrix.platform == 'windows'
         run: |
-          npx tauri build --target ${{ matrix.target }} --bundles nsis,msi --config '{"bundle":{"externalBin":["binaries/ronin-daemon"]}}'
+          npx tauri build --ci --target ${{ matrix.target }} --bundles nsis,msi --features custom-protocol --config src-tauri/tauri.release.conf.json
           mkdir -p upload
           cp src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe upload/
           cp src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi upload/
