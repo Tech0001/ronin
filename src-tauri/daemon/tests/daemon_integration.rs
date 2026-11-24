@@ -61,11 +61,12 @@ fn connect_daemon(runtime_dir: &Path) -> Option<(BufReader<TcpStream>, TcpStream
 #[test]
 fn daemon_persists_pty_and_replays_scrollback_across_reconnect() {
     let bin = env!("CARGO_BIN_EXE_ronin-daemon");
-    let runtime_dir = std::env::temp_dir().join(format!(
-        "ronin-daemon-test-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    #[cfg(unix)]
+    let base_tmp = std::path::PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let base_tmp = std::env::temp_dir();
+    let runtime_dir = base_tmp.join(format!("ronin-t-{}-{short_id}", std::process::id()));
     fs::create_dir_all(&runtime_dir).unwrap();
     #[cfg(unix)]
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
