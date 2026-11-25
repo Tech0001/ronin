@@ -6,6 +6,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+fn configure_subprocess(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW: prevent console window flashes when running rg / powershell / cmd.
+        cmd.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirEntryItem {
@@ -264,6 +279,7 @@ pub fn search_workspace(
     }
 
     let mut cmd = Command::new("rg");
+    configure_subprocess(&mut cmd);
     cmd.args([
         "--json",
         "--max-count",
@@ -409,7 +425,7 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     }
     let h = haystack.to_lowercase();
     let n = needle.to_lowercase();
-    let basename = h.rsplit('/').next().unwrap_or(&h);
+    let basename = h.rsplit(['/', '\\']).next().unwrap_or(&h);
     if basename == n {
         return Some(10000);
     }
@@ -462,7 +478,9 @@ pub fn quick_open_files(roots: &[String], query: &str) -> Result<Vec<QuickFileIt
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.clone());
 
-        let out = Command::new("rg")
+        let mut rg_cmd = Command::new("rg");
+        configure_subprocess(&mut rg_cmd);
+        let out = rg_cmd
             .args(["--files", "--color=never"])
             .arg(root)
             .output();
@@ -896,6 +914,7 @@ pub fn open_external(target: &str, cwd: Option<&str>) -> Result<(), String> {
         c
     };
 
+    configure_subprocess(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -916,7 +935,9 @@ pub fn clipboard_read() -> Result<String, String> {
     }
     #[cfg(windows)]
     {
-        if let Ok(output) = Command::new("powershell")
+        let mut cmd = Command::new("powershell");
+        configure_subprocess(&mut cmd);
+        if let Ok(output) = cmd
             .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
             .output()
         {
@@ -967,7 +988,9 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        if let Ok(mut child) = Command::new("powershell")
+        let mut cmd = Command::new("powershell");
+        configure_subprocess(&mut cmd);
+        if let Ok(mut child) = cmd
             .args([
                 "-NoProfile",
                 "-Command",

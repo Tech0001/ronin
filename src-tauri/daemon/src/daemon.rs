@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -42,6 +42,7 @@ struct Session {
     generation: String,
     seq: u64,
     pending: String,
+    last_flush: Instant,
     screen: TerminalScreen,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -139,6 +140,7 @@ fn flush_session(shared: &Arc<Mutex<DaemonState>>, id: u32) {
                 return;
             }
             session.seq += 1;
+            session.last_flush = Instant::now();
             let data = std::mem::take(&mut session.pending);
             DaemonEvent::Output {
                 id: session.id,
@@ -311,6 +313,9 @@ fn start_terminal(
         generation: generation.clone(),
         seq: 0,
         pending: String::new(),
+        last_flush: Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now),
         screen: TerminalScreen::new(rows, cols, 2000),
         master: pair.master,
         writer,
@@ -371,7 +376,10 @@ fn pty_reader_loop(
                         }
                     }
                     session.pending.push_str(&decoded);
-                    session.pending.len() >= 65536
+                    // Leading-edge flush for low-latency interactive typing echoes;
+                    // bursty output within 8ms coalesces via the background ticker.
+                    session.pending.len() >= 32768
+                        || session.last_flush.elapsed() >= Duration::from_millis(8)
                 };
                 if should_flush_now {
                     flush_session(&shared, id);
@@ -853,10 +861,10 @@ fn process_request(
 }
 
 fn spawn_background_tasks(shared: &Arc<Mutex<DaemonState>>, shutdown_tx: &mpsc::Sender<()>) {
-    // 16ms output flush ticker
+    // 8ms burst-coalescing output flush ticker
     let flush_shared = Arc::clone(shared);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(16));
+        let mut interval = tokio::time::interval(Duration::from_millis(8));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -1061,6 +1069,7 @@ pub fn run_daemon(dir_arg: Option<String>) -> Result<(), String> {
                 tokio::select! {
                     accepted = listener.accept() => {
                         if let Ok((stream, _)) = accepted {
+                            let _ = stream.set_nodelay(true);
                             let (r, w) = stream.into_split();
                             let shared_peer = Arc::clone(&shared);
                             let stx = shutdown_tx.clone();

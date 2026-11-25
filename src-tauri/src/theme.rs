@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThemePalette {
     pub source: String,
@@ -174,6 +174,15 @@ pub fn load_theme() -> ThemePalette {
     }
 }
 
+fn is_theme_change_event(kind: &notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Create(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Remove(_)
+    )
+}
+
 pub fn watch_omarchy_theme(app: AppHandle) -> Option<RecommendedWatcher> {
     let home = dirs::home_dir()?;
     let watch_dirs: Vec<PathBuf> = [
@@ -190,9 +199,20 @@ pub fn watch_omarchy_theme(app: AppHandle) -> Option<RecommendedWatcher> {
         return None;
     }
 
+    let last_palette = std::sync::Mutex::new(load_theme());
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            let palette = load_theme();
+        let Ok(event) = res else {
+            return;
+        };
+        // Ignore read/open/close access events so reading colors.toml never feeds back into inotify.
+        if !is_theme_change_event(&event.kind) {
+            return;
+        }
+        let palette = load_theme();
+        let mut last = last_palette.lock().unwrap();
+        if *last != palette {
+            *last = palette.clone();
+            drop(last);
             let _ = app.emit("theme:changed", &palette);
         }
     })
@@ -222,5 +242,22 @@ mode = "dark"
         let parsed = parse_simple_toml(sample);
         assert_eq!(parsed.get("accent").map(String::as_str), Some("#f23888"));
         assert_eq!(parsed.get("mode").map(String::as_str), Some("dark"));
+    }
+
+    #[test]
+    fn ignores_access_events_to_prevent_inotify_feedback_loop() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind};
+        assert!(!is_theme_change_event(&notify::EventKind::Access(
+            AccessKind::Open(AccessMode::Any)
+        )));
+        assert!(!is_theme_change_event(&notify::EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+        assert!(is_theme_change_event(&notify::EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(is_theme_change_event(&notify::EventKind::Create(
+            CreateKind::File
+        )));
     }
 }

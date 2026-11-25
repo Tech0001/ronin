@@ -94,6 +94,8 @@ export function App() {
   const [attentionIds, setAttentionIds] = useState<Set<number>>(() => new Set());
   const [folderBranches, setFolderBranches] = useState<Record<string, string>>({});
   const [laneGit, setLaneGit] = useState<Map<number, LaneGitInfo>>(() => new Map());
+  const laneGitRef = useRef(laneGit);
+  laneGitRef.current = laneGit;
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
   const [tabRenameDraft, setTabRenameDraft] = useState('');
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
@@ -331,7 +333,9 @@ export function App() {
       const ws = workspaceRef.current;
       try {
         const [branches, info] = await Promise.all([
-          ws.folders.length ? api.gitBranches(ws.folders) : Promise.resolve({}),
+          ws.folders.length
+            ? api.gitBranches(ws.folders)
+            : Promise.resolve<Record<string, string>>({}),
           ws.lanes.length
             ? api.laneGitInfo(
                 ws.lanes.map((l) => ({
@@ -340,13 +344,39 @@ export function App() {
                   projectDir: l.projectDir,
                 })),
               )
-            : Promise.resolve([]),
+            : Promise.resolve<LaneGitInfo[]>([]),
         ]);
         if (cancelled) return;
-        setFolderBranches(branches);
-        const map = new Map<number, LaneGitInfo>();
-        for (const item of info) map.set(item.id, item);
-        setLaneGit(map);
+        setFolderBranches((prev) => {
+          const prevKeys = Object.keys(prev);
+          const nextKeys = Object.keys(branches);
+          if (
+            prevKeys.length === nextKeys.length &&
+            nextKeys.every((k) => prev[k] === branches[k])
+          ) {
+            return prev;
+          }
+          return branches;
+        });
+        setLaneGit((prev) => {
+          if (
+            prev.size === info.length &&
+            info.every((item) => {
+              const cur = prev.get(item.id);
+              return (
+                cur !== undefined &&
+                cur.branch === item.branch &&
+                cur.repoName === item.repoName &&
+                cur.liveCwd === item.liveCwd
+              );
+            })
+          ) {
+            return prev;
+          }
+          const map = new Map<number, LaneGitInfo>();
+          for (const item of info) map.set(item.id, item);
+          return map;
+        });
       } catch {
         /* ignore transient git poll errors */
       }
@@ -552,7 +582,7 @@ export function App() {
   const handleOpenLink = useCallback(
     (target: string, laneId: number, mode: 'preview' | 'external') => {
       const lane = workspaceRef.current.lanes.find((l) => l.processId === laneId);
-      const liveCwd = laneGit.get(laneId)?.liveCwd;
+      const liveCwd = laneGitRef.current.get(laneId)?.liveCwd;
       const baseCwd = liveCwd || lane?.cwd;
       const fallbacks = [
         ...(lane?.projectDir ? [lane.projectDir] : []),
@@ -565,7 +595,7 @@ export function App() {
         openFilePreview(target, baseCwd, undefined, undefined, laneId, fallbacks);
       }
     },
-    [openFilePreview, showToast, laneGit],
+    [openFilePreview, showToast],
   );
 
   const handleAddFolder = async () => {
@@ -689,14 +719,25 @@ export function App() {
     });
   }, []);
 
-  const handleRefreshDisplay = useCallback(
-    async (id: number) => {
-      try {
-        await api.terminalRefreshDisplay(id);
-        setDisplayVersions((curr) => ({ ...curr, [id]: (curr[id] ?? 0) + 1 }));
-      } catch (err) {
-        showToast(String(err));
+  const handleTerminalFocusChange = useCallback(
+    (id: number, focused: boolean) => {
+      terminalFocusedRef.current = focused;
+      if (focused) {
+        activeLaneRef.current = id;
+        clearAttention(id);
       }
+    },
+    [clearAttention],
+  );
+
+  const handleRefreshDisplay = useCallback(
+    (id: number) => {
+      void api
+        .terminalRefreshDisplay(id)
+        .then(() => {
+          setDisplayVersions((curr) => ({ ...curr, [id]: (curr[id] ?? 0) + 1 }));
+        })
+        .catch((err) => showToast(String(err)));
     },
     [showToast],
   );
@@ -1606,17 +1647,11 @@ export function App() {
                     searchTrigger={searchTriggers[lane.processId] ?? 0}
                     registerOutput={registerOutput}
                     onOpenLink={handleOpenLink}
-                    onRefreshDisplay={(id) => void handleRefreshDisplay(id)}
-                    onFocusChange={(id, focused) => {
-                      terminalFocusedRef.current = focused;
-                      if (focused) {
-                        activeLaneRef.current = id;
-                        clearAttention(id);
-                      }
-                    }}
+                    onRefreshDisplay={handleRefreshDisplay}
+                    onFocusChange={handleTerminalFocusChange}
                     onAttention={markAttention}
                     onChangeFontSize={handleLaneFontSize}
-                    onDuplicate={(l) => void handleDuplicateLane(l)}
+                    onDuplicate={handleDuplicateLane}
                   />
 
                   <footer className="lane-footer">

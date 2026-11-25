@@ -119,6 +119,11 @@ export function FilePreviewModal({
     [data?.content],
   );
 
+  const tokenizedLines = useMemo(
+    () => lines.map((lineText) => tokenizeCodeLine(lineText, data?.ext)),
+    [lines, data?.ext],
+  );
+
   const matchLineIndices = useMemo(() => {
     const q = findQuery.trim().toLowerCase();
     if (!q) return [];
@@ -128,6 +133,8 @@ export function FilePreviewModal({
     });
     return indices;
   }, [lines, findQuery]);
+
+  const matchLineSet = useMemo(() => new Set(matchLineIndices), [matchLineIndices]);
 
   const highlightedMatchLine =
     matchLineIndices.length > 0
@@ -441,9 +448,9 @@ export function FilePreviewModal({
             {lines.map((lineText, idx) => {
               const lineNum = (data.startLine ?? 1) + idx;
               const isTarget = lineNum === data.line;
-              const isMatch = findQuery.trim() && matchLineIndices.includes(idx);
+              const isMatch = matchLineSet.has(idx);
               const isActiveMatch = idx === highlightedMatchLine;
-              const tokens = tokenizeCodeLine(lineText, data.ext);
+              const tokens = tokenizedLines[idx];
               return (
                 <div
                   key={lineNum}

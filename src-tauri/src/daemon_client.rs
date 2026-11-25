@@ -249,6 +249,7 @@ async fn connect_transport(
     let stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .map_err(|e| e.to_string())?;
+    let _ = stream.set_nodelay(true);
     let (r, w) = stream.into_split();
     Ok((Box::new(r), Box::new(w)))
 }

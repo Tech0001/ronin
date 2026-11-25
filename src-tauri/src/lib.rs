@@ -197,7 +197,9 @@ async fn terminal_copy(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     if !selection.is_empty() {
-        clipboard_write(&selection)?;
+        tokio::task::spawn_blocking(move || clipboard_write(&selection))
+            .await
+            .map_err(|e| format!("Task join error: {e}"))??;
         return Ok("clipboard".into());
     }
     let shell_pid = state.daemon.known_pid(id);
@@ -356,8 +358,10 @@ async fn fs_lane_git_info(
 }
 
 #[tauri::command]
-fn fs_open_external(target: String, cwd: Option<String>) -> Result<(), String> {
-    open_external(&target, cwd.as_deref())
+async fn fs_open_external(target: String, cwd: Option<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || open_external(&target, cwd.as_deref()))
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -366,13 +370,17 @@ fn fs_is_dir(path: String) -> bool {
 }
 
 #[tauri::command]
-fn sys_clipboard_read() -> Result<String, String> {
-    clipboard_read()
+async fn sys_clipboard_read() -> Result<String, String> {
+    tokio::task::spawn_blocking(clipboard_read)
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
 }
 
 #[tauri::command]
-fn sys_clipboard_write(text: String) -> Result<(), String> {
-    clipboard_write(&text)
+async fn sys_clipboard_write(text: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || clipboard_write(&text))
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -35,7 +35,7 @@ interface RenderItem {
 
 const ANSI_STRIP_RE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
 
-export function TerminalPane({
+export const TerminalPane = React.memo(function TerminalPane({
   lane,
   remote,
   connected,
@@ -339,25 +339,31 @@ export function TerminalPane({
     const pump = () => {
       if (rendering || disposed || !queue.length) return;
       rendering = true;
-      const item = queue.shift()!;
-      if (item.type === 'replay') {
+      const first = queue.shift()!;
+      let data = first.data;
+      if (first.type === 'replay') {
         term.clearSelection();
         term.reset();
         outputTail = '';
-        if (item.cols && item.rows) {
-          term.resize(item.cols, item.rows);
+        if (first.cols && first.rows) {
+          term.resize(first.cols, first.rows);
+        }
+      } else {
+        // Coalesce all pending live output chunks into a single xterm write so bursts
+        // and rapid typing never serialize one-chunk-per-animation-frame.
+        while (queue.length && queue[0].type === 'output') {
+          data += queue.shift()!.data;
         }
       }
-      const data = item.data;
       const clearedScreen =
-        item.type === 'output' && /\x1b\[(?:[023]?J|\?1049[hl])/.test(outputTail + data);
-      if (item.type === 'output') outputTail = data.slice(-12);
+        first.type === 'output' && /\x1b\[(?:[023]?J|\?1049[hl])/.test(outputTail + data);
+      if (first.type === 'output') outputTail = data.slice(-12);
       term.write(data, () => {
         if (disposed) return;
         if (clearedScreen || (term.hasSelection() && !term.getSelection().trim())) {
           term.clearSelection();
         }
-        if (item.type === 'replay') {
+        if (first.type === 'replay') {
           attachedRef.current = true;
           resetAttentionQuiet(2200);
           fitAddon.fit();
@@ -735,4 +741,4 @@ export function TerminalPane({
         )}
     </>
   );
-}
+});
